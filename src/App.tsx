@@ -1,14 +1,19 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, FormEvent, ReactNode } from "react";
 import Editor from "@monaco-editor/react";
+import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 import { QRCodeSVG } from "qrcode.react";
+import ceoAvatar from "./assets/team-mira-solen.svg";
+import ctoAvatar from "./assets/team-tavian-ro.svg";
+import productAvatar from "./assets/team-elowen-pike.svg";
+import trustAvatar from "./assets/team-soren-vale.svg";
 import {
   ArrowDownRight, ArrowLeft, ArrowRight, BadgeCheck, BarChart3, BrainCircuit, Check,
   CheckCircle2, ChevronRight, CircleHelp, ClipboardCheck, Clock3, Code2, Copy, ExternalLink,
   Eye, FileCode2, Flag, KeyRound, LayoutDashboard, Lightbulb, LockKeyhole, MessageSquareText, Plus,
   Radio, Shield, ShieldCheck, Sparkles, Upload, Users, WandSparkles, X,
 } from "lucide-react";
-import { Link, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "./lib/api";
 import type { Candidate, TaskVariant, TimelineEvent, VivaAnswer } from "./types";
 
@@ -34,34 +39,35 @@ function TopNav({ dashboard = false }: { dashboard?: boolean }) {
   return <header className="top-nav sticky top-0 z-30 border-b backdrop-blur-xl">
     <div className="mx-auto flex h-[68px] max-w-[1240px] items-center justify-between px-5 lg:px-8">
       <Logo />
-      {dashboard ? <nav className="hidden items-center gap-1 sm:flex">
-        <Link to="/dashboard" className="nav-active flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium"><LayoutDashboard size={16} /> Dashboard</Link>
-        <Link to="/verify" className="rounded-lg px-3.5 py-2 text-sm transition">Verify credential</Link>
-        <Link to="/" className="rounded-lg px-3.5 py-2 text-sm transition">Candidate experience</Link>
-      </nav> : <nav className="hidden items-center gap-7 text-[13px] md:flex">
-        <a href="#features" className="transition">Features</a>
-        <a href="#how-it-works" className="transition">How it works</a>
-        <a href="#principles" className="transition">Our principles</a>
-        <Link to="/dashboard" className="transition">For hiring teams</Link>
-        <Link to="/verify" className="transition">Verify credential</Link>
+      {dashboard ? <nav aria-label="Hiring workspace" className="hidden items-center gap-1 md:flex">
+        <Link to="/dashboard" title="Dashboard" aria-label="Dashboard" className="nav-active flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium"><LayoutDashboard size={16} /> Dashboard</Link>
+        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm transition"><BadgeCheck size={16} /> Verify</Link>
+        <Link to="/" title="Candidate experience" aria-label="Candidate experience" className="flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm transition"><Users size={16} /> Candidate</Link>
+      </nav> : <nav aria-label="Main navigation" className="hidden items-center gap-5 text-[13px] md:flex">
+        <a href="#features" title="Features" aria-label="Features" className="flex items-center gap-2 transition"><Sparkles size={15} /> Features</a>
+        <a href="#how-it-works" title="How it works" aria-label="How it works" className="flex items-center gap-2 transition"><ClipboardCheck size={15} /> How it works</a>
+        <a href="#principles" title="Our principles" aria-label="Our principles" className="flex items-center gap-2 transition"><ShieldCheck size={15} /> Principles</a>
+        <Link to="/dashboard" title="For hiring teams" aria-label="For hiring teams" className="flex items-center gap-2 transition"><LayoutDashboard size={15} /> Hiring teams</Link>
+        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex items-center gap-2 transition"><BadgeCheck size={15} /> Verify</Link>
       </nav>}
       <div className="flex items-center gap-3">
-        <Link to="/dashboard" className="nav-signin hidden text-[13px] font-medium sm:inline">Sign in</Link>
-        <Link to="/assessment" className="nav-cta inline-flex items-center gap-2 rounded-full px-4 py-2.5 text-[13px] font-semibold text-white transition">
-          Try the demo <ArrowRight size={14} />
+        <Link to="/dashboard" title="Sign in" aria-label="Sign in" className="nav-signin hidden items-center gap-1.5 text-[13px] font-medium md:inline-flex"><Users size={15} /> Sign in</Link>
+        <Link to="/assessment" title="Try the demo" aria-label="Try the demo" className="nav-cta primary-glow inline-flex items-center gap-2 rounded-full px-3.5 py-2.5 text-[13px] font-semibold text-white transition md:px-4">
+          <Code2 size={15} /><span className="hidden md:inline">Try the demo</span><ArrowRight className="hidden md:block" size={14} />
         </Link>
       </div>
     </div>
-    <nav aria-label="Mobile navigation" className={`mobile-nav mx-auto flex max-w-[1240px] gap-5 overflow-x-auto px-5 pb-3 text-xs lg:px-8 ${dashboard ? "sm:hidden" : "md:hidden"}`}>
+    <nav aria-label="Mobile navigation" className="mobile-nav mx-auto flex max-w-[1240px] gap-5 overflow-x-auto px-5 pb-3 text-xs md:hidden lg:px-8">
       {dashboard ? <>
-        <Link to="/dashboard" className="shrink-0 font-medium">Dashboard</Link>
-        <Link to="/verify" className="shrink-0">Verify credential</Link>
-        <Link to="/" className="shrink-0">Candidate experience</Link>
+        <Link to="/dashboard" title="Dashboard" aria-label="Dashboard" className="flex shrink-0 items-center gap-2 font-medium"><LayoutDashboard size={16} /><span className="hidden md:inline">Dashboard</span></Link>
+        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex shrink-0 items-center gap-2"><BadgeCheck size={16} /><span className="hidden md:inline">Verify</span></Link>
+        <Link to="/" title="Candidate experience" aria-label="Candidate experience" className="flex shrink-0 items-center gap-2"><Users size={16} /><span className="hidden md:inline">Candidate</span></Link>
       </> : <>
-        <a href="#features" className="shrink-0">Features</a>
-        <a href="#how-it-works" className="shrink-0">How it works</a>
-        <Link to="/dashboard" className="shrink-0">For hiring teams</Link>
-        <Link to="/verify" className="shrink-0">Verify credential</Link>
+        <a href="#features" title="Features" aria-label="Features" className="flex shrink-0 items-center gap-2"><Sparkles size={16} /><span className="hidden md:inline">Features</span></a>
+        <a href="#how-it-works" title="How it works" aria-label="How it works" className="flex shrink-0 items-center gap-2"><ClipboardCheck size={16} /><span className="hidden md:inline">How it works</span></a>
+        <a href="#principles" title="Our principles" aria-label="Our principles" className="flex shrink-0 items-center gap-2"><ShieldCheck size={16} /><span className="hidden md:inline">Principles</span></a>
+        <Link to="/dashboard" title="For hiring teams" aria-label="For hiring teams" className="flex shrink-0 items-center gap-2"><LayoutDashboard size={16} /><span className="hidden md:inline">Hiring teams</span></Link>
+        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex shrink-0 items-center gap-2"><BadgeCheck size={16} /><span className="hidden md:inline">Verify</span></Link>
       </>}
     </nav>
   </header>;
@@ -80,43 +86,91 @@ function summarizePrompt(prompt: string) {
 
 function LoadingScreen() {
   const [progress, setProgress] = useState(0);
+  const [statusIndex, setStatusIndex] = useState(0);
+  const reduceMotion = useReducedMotion();
+  const statuses = [
+    "Initializing secure session...",
+    "Loading assessment engine...",
+    "Verifying process signals...",
+  ];
 
   useEffect(() => {
-    const interval = window.setInterval(() => {
-      setProgress((current) => (current >= 100 ? 100 : current + 8));
-    }, 120);
-
-    const timeout = window.setTimeout(() => {
-      window.clearInterval(interval);
-      setProgress(100);
-    }, 1500);
+    const progressInterval = window.setInterval(() => {
+      setProgress((current) => Math.min(current + 7, 100));
+    }, 100);
+    const statusInterval = reduceMotion ? undefined : window.setInterval(() => {
+      setStatusIndex((current) => (current + 1) % statuses.length);
+    }, 500);
 
     return () => {
-      window.clearInterval(interval);
-      window.clearTimeout(timeout);
+      window.clearInterval(progressInterval);
+      if (statusInterval !== undefined) window.clearInterval(statusInterval);
     };
-  }, []);
+  }, [reduceMotion, statuses.length]);
 
-  return <div className="loading-screen" aria-live="polite" aria-busy="true">
-    <div className="loading-scene" aria-hidden="true">
-      <div className="loading-cube">
-        <span className="cube-face cube-front" />
-        <span className="cube-face cube-back" />
-        <span className="cube-face cube-right" />
-        <span className="cube-face cube-left" />
-        <span className="cube-face cube-top" />
-        <span className="cube-face cube-bottom" />
+  return <motion.div
+    className={`loading-screen${reduceMotion ? " loading-screen-reduced" : ""}`}
+    initial={{ opacity: 0 }}
+    animate={{ opacity: 1 }}
+    exit={{ opacity: 0 }}
+    transition={{ duration: reduceMotion ? 0.2 : 0.35 }}
+    aria-busy="true"
+  >
+    <div className="loading-content">
+      <div className="loading-emblem" aria-hidden="true">
+        <motion.div
+          className="loading-orbit loading-orbit-outer"
+          animate={reduceMotion ? undefined : { rotate: 360 }}
+          transition={{ duration: 7, ease: "linear", repeat: Infinity }}
+        />
+        <motion.div
+          className="loading-orbit loading-orbit-inner"
+          animate={reduceMotion ? undefined : { rotate: -360 }}
+          transition={{ duration: 5, ease: "linear", repeat: Infinity }}
+        />
+        <div className="loading-shield"><ShieldCheck size={39} strokeWidth={1.5} /></div>
+      </div>
+      <div className="loading-brand">skillproof<span>.</span></div>
+      <p className="loading-copy">Secure assessment workspace</p>
+      <div className="loading-progress-row">
+        <div
+          className="loading-bar"
+          role="progressbar"
+          aria-label="Loading SkillProof"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progress}
+        >
+          <motion.span
+            animate={{ width: `${progress}%` }}
+            transition={{ duration: reduceMotion ? 0 : 0.12, ease: "linear" }}
+          />
+        </div>
+        <span className="loading-percentage">{progress}%</span>
+      </div>
+      <div className="loading-status" aria-live="polite">
+        <AnimatePresence mode="wait" initial={false}>
+          <motion.p
+            key={reduceMotion ? statuses[0] : statuses[statusIndex]}
+            initial={{ opacity: 0, y: reduceMotion ? 0 : 5 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: reduceMotion ? 0 : -5 }}
+            transition={{ duration: reduceMotion ? 0.15 : 0.2 }}
+          >
+            {reduceMotion ? statuses[0] : statuses[statusIndex]}
+          </motion.p>
+        </AnimatePresence>
       </div>
     </div>
-    <div className="loading-brand">skillproof<span>.</span></div>
-    <p className="loading-copy">Loading evidence…</p>
-    <div className="loading-bar" aria-hidden="true">
-      <span style={{ width: `${progress}%` }} />
-    </div>
-  </div>;
+  </motion.div>;
+}
+
+function SkeletonLoader({ className = "" }: { className?: string }) {
+  return <span aria-hidden="true" className={`skeleton-loader ${className}`} />;
 }
 
 function Home() {
+  const reduceMotion = useReducedMotion();
   const steps = [
     { number: "01", icon: ClipboardCheck, title: "A real task", text: "Candidates work on the same practical challenge in a focused workspace.", color: "mint" },
     { number: "02", icon: Radio, title: "Process, not just output", text: "With consent, see how an idea takes shape through edits and decisions.", color: "pink" },
@@ -131,6 +185,12 @@ function Home() {
     { icon: Code2, title: "Live skill check", text: "A timed debugging follow-up with transparent test results.", accent: "pink" },
     { icon: Shield, title: "Responsible analysis", text: "Text-style observations are weak context and add zero score points.", accent: "mint" },
   ];
+  const team = [
+    { name: "Mira Solen", role: "CEO", bio: "Builds people-first hiring experiences grounded in clear evidence.", avatar: ceoAvatar },
+    { name: "Tavian Ro", role: "CTO", bio: "Turns thoughtful assessment ideas into reliable, privacy-aware tools.", avatar: ctoAvatar },
+    { name: "Elowen Pike", role: "Head of Product", bio: "Shapes focused workflows that help candidates show their thinking.", avatar: productAvatar },
+    { name: "Soren Vale", role: "Head of Trust & Safety", bio: "Keeps fairness, consent, and transparency central to every review.", avatar: trustAvatar },
+  ];
   return <div className="landing-page min-h-screen">
     <TopNav />
     <main>
@@ -141,7 +201,7 @@ function Home() {
             <h1>See the thinking.<br />Meet the <span>real talent.</span></h1>
             <p>Great hiring is more than a perfect answer. SkillProof brings the process, reasoning, and practical skill into one clear picture — with AI treated as a tool, not a verdict.</p>
             <div className="hero-actions">
-              <Link to="/assessment" className="hero-primary">Try the live demo <ArrowRight size={16} /></Link>
+              <Link to="/assessment" className="hero-primary primary-glow">Try the live demo <ArrowRight size={16} /></Link>
               <a href="#how-it-works" className="hero-secondary">Explore the platform <ArrowDownRight size={16} /></a>
             </div>
             <div className="hero-trust">
@@ -206,6 +266,31 @@ function Home() {
           <div className="principles-card-foot"><span><i /> TRUST BY DESIGN</span><span>SKILLPROOF · 2026</span></div>
         </div>
       </section>
+      <section className="team-section" aria-labelledby="team-heading">
+        <div className="team-heading">
+          <span className="section-kicker">THE PEOPLE BEHIND THE PLATFORM</span>
+          <h2 id="team-heading">Meet the team</h2>
+          <p>A small, fictional team built around thoughtful, evidence-led hiring.</p>
+        </div>
+        <div className="team-grid">
+          {team.map(({ name, role, bio, avatar }, index) => <motion.article
+            key={name}
+            className="team-card"
+            initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 14 }}
+            whileInView={{ opacity: 1, y: 0 }}
+            viewport={{ once: true, amount: 0.2 }}
+            transition={{ duration: reduceMotion ? 0.2 : 0.45, delay: reduceMotion ? 0 : index * 0.08 }}
+          >
+            <img className="team-avatar" src={avatar} alt="" aria-hidden="true" />
+            <div className="team-card-copy">
+              <h3>{name}</h3>
+              <p className="team-role">{role}</p>
+              <p className="team-bio">{bio}</p>
+            </div>
+          </motion.article>)}
+        </div>
+        <p className="team-footnote">Illustrative team for demo purposes.</p>
+      </section>
     </main>
     <footer className="landing-footer"><div><Logo /><span>Clear evidence. Fairer conversations. Better hiring.</span><span>© {new Date().getFullYear()} SkillProof</span></div></footer>
   </div>;
@@ -252,7 +337,7 @@ function ConsentStart({ onStart }: { onStart: (name: string, email: string, extr
       </label>
       <label className="mt-3 flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#67756c]"><input type="checkbox" checked={extraTime} onChange={(event) => setExtraTime(event.target.checked)} className="mt-0.5 accent-[#477e55]" />Accessibility option: add five minutes to the assessment timer.</label>
       {error && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-3 py-2 text-[11px] text-[#a34c47]">{error}</p>}
-      <button disabled={!consent || !name.trim() || starting} onClick={start} className="mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad]">{starting ? "Preparing your task…" : "I consent and start"} {!starting && <ArrowRight size={15} />}</button>
+      <button disabled={!consent || !name.trim() || starting} onClick={start} className="primary-glow mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad]">{starting ? "Preparing your task…" : "I consent and start"} {!starting && <ArrowRight size={15} />}</button>
       <p className="mt-2 text-center text-[9px] text-[#9aa49d]">You can leave at any time. Evidence is used for this assessment only.</p>
     </div>
   </div>;
@@ -475,7 +560,12 @@ function Assessment() {
     <main className="mx-auto max-w-[1370px] px-4 pb-8 pt-5 sm:px-6 lg:px-8">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-xs text-[#87938b]"><Link to="/" className="hover:text-[#395c44]">Home</Link><ChevronRight size={13} /><span className="font-medium text-[#3d4d43]">Assessment</span></div>
-        <div className="flex items-center gap-2"><span className={`flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[10px] font-semibold ${consent ? "bg-[#eaf5ed] text-[#43805a]" : "bg-[#eff2ef] text-[#78857d]"}`}><span className={`size-1.5 rounded-full ${consent ? "animate-pulse bg-[#4eaa6a]" : "bg-[#a6b0a9]"}`} />{consent ? "Recording process (with consent)" : "Recording paused"}</span><span className="rounded-full border border-[#e4eae5] bg-white px-3 py-1.5 text-[11px] tabular-nums text-[#65736a]"><Clock3 className="mr-1 inline" size={12} />{time} left</span></div>
+        <div className="flex items-center gap-2">
+          <span role="status" title={consent ? "Recording process with consent" : "Recording paused"} aria-label={consent ? "Recording process with consent" : "Recording paused"} className={`flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[10px] font-semibold ${consent ? "bg-[#eaf5ed] text-[#43805a]" : "bg-[#eff2ef] text-[#78857d]"}`}>
+            <Radio size={13} /><span className={`size-1.5 rounded-full ${consent ? "animate-pulse bg-[#4eaa6a]" : "bg-[#a6b0a9]"}`} /><span className="hidden sm:inline">{consent ? "Recording" : "Paused"}</span>
+          </span>
+          <span role="timer" title={`${time} remaining`} aria-label={`${time} remaining`} className="inline-flex items-center gap-1.5 rounded-full border border-[#e4eae5] bg-white px-3 py-1.5 text-[11px] tabular-nums text-[#65736a]"><Clock3 size={13} />{time}<span className="hidden sm:inline">left</span></span>
+        </div>
       </div>
       {requirementUpdate && <div role="status" className="requirement-banner mb-4 rounded-2xl border border-[#f0dfbd] bg-[#fff9eb] px-5 py-3.5 text-[12px] leading-5 text-[#82652e]"><strong>Requirement update:</strong> {requirementUpdate}</div>}
       <div className="grid items-start gap-4 xl:grid-cols-[270px_minmax(0,1fr)_300px]">
@@ -492,14 +582,23 @@ function Assessment() {
         <section className="overflow-hidden rounded-[20px] border border-[#e5ebe6] bg-white shadow-[0_6px_25px_#17321b08]">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ed] px-5 py-4">
             <div><h2 className="text-[13px] font-semibold">Solution editor</h2><p className="mt-1 text-[10px] text-[#89958d]">Make changes in small steps and verify edge cases.</p></div>
-            <button onClick={() => setAssistantOpen((open) => !open)} className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3 py-2 text-[11px] font-semibold text-[#52645a] hover:bg-[#f5f9f6] xl:hidden"><Sparkles size={14} /> {assistantOpen ? "Hide assistant" : "AI assistant"}</button>
           </div>
           <div className="editor-shell h-[430px] overflow-hidden bg-[#111b18] sm:h-[500px]">
             <Editor height="100%" defaultLanguage="javascript" theme="vs-dark" value={code} onChange={(value) => { codeRef.current = value || ""; setCode(value || ""); }} onMount={onEditorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineHeight: 23, padding: { top: 18 }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2, automaticLayout: true, renderLineHighlight: "line", guides: { indentation: true }, scrollbar: { verticalScrollbarSize: 7 } }} />
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0ed] bg-[#fcfdfb] px-5 py-3">
             <div className="flex flex-wrap items-center gap-3 text-[10px] text-[#8a968f]"><span className="flex items-center gap-1.5"><Code2 size={12} />{eventCount.current} edits</span><span className="flex items-center gap-1.5"><KeyRound size={12} />{keypressCount} keys</span><span className="flex items-center gap-1.5"><Upload size={12} />{events.filter((item) => item.type === "paste").length} pastes</span></div>
-            <div className="flex items-center gap-2"><button onClick={runSampleChecks} disabled={!consent} className="rounded-full border border-[#e4ebe5] px-3.5 py-2 text-[10px] font-semibold text-[#52645a] disabled:opacity-50">Record test attempt</button><button onClick={submit} disabled={!consent || submitting || assistantBusy} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-2.5 text-[12px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad]">{submitting ? "Preparing viva…" : "Submit & continue"}<ArrowRight size={14} /></button></div>
+            <div className="flex items-center gap-2">
+              <button type="button" onClick={() => setAssistantOpen((open) => !open)} title={assistantOpen ? "Hide AI assistant" : "AI assistant"} aria-label={assistantOpen ? "Hide AI assistant" : "AI assistant"} aria-pressed={assistantOpen} className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3.5 py-2.5 text-[10px] font-semibold text-[#52645a] hover:bg-[#f5f9f6]">
+                <Sparkles size={14} /><span className="hidden sm:inline">{assistantOpen ? "Hide assistant" : "AI assistant"}</span>
+              </button>
+              <button type="button" onClick={runSampleChecks} disabled={!consent} title="Run tests" aria-label="Run tests" className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3.5 py-2.5 text-[10px] font-semibold text-[#52645a] disabled:opacity-50">
+                <ClipboardCheck size={14} /><span className="hidden sm:inline">Run tests</span>
+              </button>
+              <button type="button" onClick={submit} disabled={!consent || submitting || assistantBusy} title={submitting ? "Preparing viva" : "Submit and continue"} aria-label={submitting ? "Preparing viva" : "Submit and continue"} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-3.5 py-2.5 text-[11px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad] sm:px-5">
+                <span className="hidden sm:inline">{submitting ? "Preparing viva…" : "Submit"}</span><ArrowRight size={14} />
+              </button>
+            </div>
           </div>
           {error && <p role="alert" className="border-t border-[#f3d7d4] bg-[#fff7f6] px-5 py-3 text-xs text-[#a34c47]">{error}</p>}
         </section>
@@ -567,7 +666,7 @@ function Viva() {
           <textarea id="viva-answer" value={answer} onChange={(event) => setAnswer(event.target.value)} disabled={!active || busy} placeholder="Take a moment to explain your reasoning…" rows={5} className="mt-2 w-full resize-y rounded-xl border border-[#e3e9e4] bg-white p-4 text-[13px] leading-6 outline-none transition placeholder:text-[#a3ada6] focus:border-[#81af8c] focus:ring-4 focus:ring-[#e7f2e9] disabled:opacity-60" />
         </div>
         {error && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
-        <div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-[11px] text-[#89958d]">Your answer is scored for demonstrated understanding.</p><button disabled={!active || !answer.trim() || busy} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{busy ? "Reviewing…" : current + 1 === questions.length ? "Finish viva" : "Next question"}<ArrowRight size={14} /></button></div>
+        <div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-[11px] text-[#89958d]">Your answer is scored for demonstrated understanding.</p><button disabled={!active || !answer.trim() || busy} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{busy ? "Reviewing…" : current + 1 === questions.length ? "Finish viva" : "Next question"}<ArrowRight size={14} /></button></div>
       </form>
     </div>
     <div className="mt-4 flex items-center justify-center gap-2 text-[10px] text-[#98a29b]"><LockKeyhole size={12} />Your answers are shared with the hiring team for this assessment only.</div>
@@ -692,7 +791,7 @@ function LiveCheckChallenge() {
       <CheckCircle2 className="mx-auto text-[#4e9666]" size={28} />
       <h1 className="mt-4 text-2xl font-semibold">Live skill check recorded</h1>
       <p className="mt-2 text-sm text-[#738078]">{candidate.live_check.passed} of {candidate.live_check.total} tests passed.</p>
-      <Link to={`/candidates/${candidate.id}`} className="mt-6 inline-flex rounded-full bg-[#1d3d2e] px-5 py-3 text-xs font-semibold text-white">View assessment report</Link>
+      <Link to={`/candidates/${candidate.id}`} className="primary-glow mt-6 inline-flex rounded-full bg-[#1d3d2e] px-5 py-3 text-xs font-semibold text-white">View assessment report</Link>
     </div>
   </main></PageFrame>;
 
@@ -721,7 +820,7 @@ function LiveCheckChallenge() {
         </div>
         <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0ed] bg-[#fcfdfb] px-5 py-4">
           <span className="text-[10px] text-[#89958d]">Attempts: {attempts}{lastTest !== null && <span className="ml-2">· Last run: {lastTest}/4 passed</span>}</span>
-          <button onClick={runTests} disabled={!running || remaining === 0} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]"><Code2 size={13} />Run tests</button>
+          <button onClick={runTests} disabled={!running || remaining === 0} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]"><Code2 size={13} />Run tests</button>
         </div>
         {lastTest !== null && <div aria-live="polite" className="border-t border-[#edf0ed] px-5 py-4">
           <div className="mb-2 text-[11px] font-semibold text-[#56645b]">Focused test results</div>
@@ -738,7 +837,7 @@ function LiveCheckChallenge() {
           {!running && <div className="mt-4 space-y-3">
             <label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#67756c]"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} className="mt-0.5 accent-[#477e55]" />I understand this timed check records test attempts, time, and tab visibility.</label>
             <label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#67756c]"><input type="checkbox" checked={extraTime} onChange={(event) => setExtraTime(event.target.checked)} className="mt-0.5 accent-[#477e55]" />Accessibility option: add two minutes</label>
-            <button onClick={() => { setRemaining(duration); setRunning(true); }} disabled={!consent} className="w-full rounded-full bg-[#1d3d2e] px-4 py-3 text-[11px] font-semibold text-white disabled:bg-[#aab8ad]">Start {Math.round(duration / 60)}-minute check</button>
+            <button onClick={() => { setRemaining(duration); setRunning(true); }} disabled={!consent} className="primary-glow w-full rounded-full bg-[#1d3d2e] px-4 py-3 text-[11px] font-semibold text-white disabled:bg-[#aab8ad]">Start {Math.round(duration / 60)}-minute check</button>
           </div>}
           {running && <div className="mt-4 flex items-center gap-2 rounded-xl bg-[#edf6ef] p-3 text-[10px] font-medium text-[#4d805b]"><span className="size-2 animate-pulse rounded-full bg-[#55a66d]" />Timed check active · visibility monitoring on</div>}
           {remaining === 0 && <p className="mt-3 text-[10px] text-[#9b6b22]">Time is up. Save the latest test result to continue.</p>}
@@ -749,7 +848,7 @@ function LiveCheckChallenge() {
           <p className="mt-3 text-[9px] leading-4 text-[#89958d]">A test result is one part of the evidence. Focus changes and test attempts are not standalone decisions.</p>
         </section>
         {error && <p role="alert" className="rounded-xl bg-[#fff4f2] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
-        <button onClick={submitCheck} disabled={!candidate || lastTest === null || submitting} className="w-full rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{submitting ? "Saving evidence…" : "Finish & view report"}<ArrowRight className="ml-2 inline" size={14} /></button>
+        <button onClick={submitCheck} disabled={!candidate || lastTest === null || submitting} className="primary-glow w-full rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{submitting ? "Saving evidence…" : "Finish & view report"}<ArrowRight className="ml-2 inline" size={14} /></button>
       </aside>
     </div>
   </main></PageFrame>;
@@ -790,9 +889,9 @@ function Dashboard() {
   return <PageFrame dashboard><div className="mx-auto grid max-w-[1450px] gap-5 px-5 pb-12 pt-6 lg:grid-cols-[215px_minmax(0,1fr)] lg:px-8">
     <aside className="h-fit rounded-[20px] border border-[#e6ece7] bg-white p-3 shadow-[0_6px_20px_#1c352808] lg:sticky lg:top-24">
       <div className="px-3 py-2 text-[9px] font-semibold uppercase tracking-[.14em] text-[#9aa49c]">Workspace</div>
-      <Link to="/dashboard" className="flex items-center gap-2.5 rounded-xl bg-[#edf5ef] px-3 py-2.5 text-[11px] font-semibold text-[#426f4d]"><LayoutDashboard size={14} /> Candidate overview</Link>
-      <Link to="/verify" className="mt-1 flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-[11px] font-medium text-[#728078] hover:bg-[#f7faf7]"><BadgeCheck size={14} /> Credential verification</Link>
-      <Link to="/assessment" className="mt-1 flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-[11px] font-medium text-[#728078] hover:bg-[#f7faf7]"><Plus size={14} /> Invite candidate</Link>
+      <Link to="/dashboard" title="Candidate overview" aria-label="Candidate overview" className="flex items-center justify-center gap-2.5 rounded-xl bg-[#edf5ef] px-3 py-2.5 text-[11px] font-semibold text-[#426f4d] sm:justify-start"><LayoutDashboard size={15} /><span className="hidden sm:inline">Overview</span></Link>
+      <Link to="/verify" title="Credential verification" aria-label="Credential verification" className="mt-1 flex items-center justify-center gap-2.5 rounded-xl px-3 py-2.5 text-[11px] font-medium text-[#728078] hover:bg-[#f7faf7] sm:justify-start"><BadgeCheck size={15} /><span className="hidden sm:inline">Verify</span></Link>
+      <Link to="/assessment" title="Invite candidate" aria-label="Invite candidate" className="mt-1 flex items-center justify-center gap-2.5 rounded-xl px-3 py-2.5 text-[11px] font-medium text-[#728078] hover:bg-[#f7faf7] sm:justify-start"><Plus size={15} /><span className="hidden sm:inline">Invite</span></Link>
       <div className="mt-4 rounded-xl bg-[#f7faf7] p-3"><div className="flex items-center gap-2 text-[10px] font-semibold text-[#4c6854]"><ShieldCheck size={13} /> Fair review</div><p className="mt-1.5 text-[9px] leading-4 text-[#87938b]">Scores summarize evidence; a human makes the final decision.</p></div>
     </aside>
     <main className="min-w-0">
@@ -808,16 +907,21 @@ function Dashboard() {
           { icon: BarChart3, name: "Average score", value: `${averageScore}/100`, color: "bg-[#eef1f7] text-[#65749a]" },
         ].map(({ icon: Icon, name: label, value, color }) => <div key={label} className="rounded-2xl border border-[#e6ece7] bg-white px-4 py-3.5 shadow-[0_6px_20px_#1c352808] sm:px-5">
           <div className="flex items-center justify-between gap-2"><span className="text-[10px] font-medium text-[#78847c]">{label}</span><span className={`grid size-7 place-items-center rounded-lg ${color}`}><Icon size={14} /></span></div>
-          <div className="mt-2 text-[24px] font-semibold tracking-[-.05em] tabular-nums text-[#26372d]">{loading ? <span aria-label="Loading" className="inline-block h-7 w-10 animate-pulse rounded-lg bg-[#edf1ed]" /> : value}</div>
+          <div className="mt-2 text-[24px] font-semibold tracking-[-.05em] tabular-nums text-[#26372d]">{loading ? <SkeletonLoader className="h-7 w-10 rounded-lg" /> : value}</div>
         </div>)}
       </div>
       <section aria-busy={loading} className="mt-5 overflow-hidden rounded-[20px] border border-[#e6ece7] bg-white shadow-[0_8px_28px_#1c352808]">
-        <div className="flex flex-col justify-between gap-3 border-b border-[#edf0ed] px-5 py-4 sm:flex-row sm:items-center"><div><h2 className="text-[14px] font-semibold">Recent assessments</h2><p className="mt-1 text-[10px] text-[#8b978f]">Evidence is a guide for human review, never an automated hiring decision.</p></div><Link to="/assessment" className="inline-flex items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[10px] font-semibold text-white hover:bg-[#28523d]"><Plus size={13} /> Invite a candidate</Link></div>
+        <div className="flex flex-col justify-between gap-3 border-b border-[#edf0ed] px-5 py-4 sm:flex-row sm:items-center"><div><h2 className="text-[14px] font-semibold">Recent assessments</h2><p className="mt-1 text-[10px] text-[#8b978f]">Evidence is a guide for human review, never an automated hiring decision.</p></div><Link to="/assessment" className="primary-glow inline-flex items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[10px] font-semibold text-white hover:bg-[#28523d]"><Plus size={13} /> Invite a candidate</Link></div>
         <div role="group" aria-label="Filter candidates by verdict" className="flex flex-wrap gap-2 border-b border-[#edf0ed] px-5 py-3">
-          {["All", "Verified skill", "Needs review", "Low confidence"].map((item) => <button key={item} type="button" onClick={() => setFilter(item)} aria-pressed={filter === item} className={`rounded-full border px-3.5 py-2 text-[10px] font-semibold transition ${filter === item ? "border-[#c9dfce] bg-[#edf6ef] text-[#457351]" : "border-[#e8ece8] bg-white text-[#7e8982] hover:bg-[#f8faf8]"}`}>{item}{item === "Low confidence" ? ` · ${lowConfidence}` : ""}</button>)}
+          {[
+            { label: "All", value: "All", icon: LayoutDashboard },
+            { label: "Verified", value: "Verified skill", icon: BadgeCheck },
+            { label: "Needs review", value: "Needs review", icon: CircleHelp },
+            { label: "Low confidence", value: "Low confidence", icon: Flag },
+          ].map(({ label, value, icon: Icon }) => <button key={value} type="button" onClick={() => setFilter(value)} aria-label={label} aria-pressed={filter === value} title={label} className={`inline-flex items-center gap-1.5 rounded-full border px-3.5 py-2 text-[10px] font-semibold transition focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#426f4d] ${filter === value ? "border-[#c9dfce] bg-[#edf6ef] text-[#457351]" : "border-[#e8ece8] bg-white text-[#7e8982] hover:bg-[#f8faf8]"}`}><Icon size={13} />{label}{value === "Low confidence" ? ` · ${lowConfidence}` : ""}</button>)}
         </div>
         {error && <p role="alert" className="border-b border-[#f2dbd8] bg-[#fff7f6] px-5 py-3 text-xs text-[#a34c47]">{error}</p>}
-        {loading && <div role="status" className="space-y-3 px-5 py-5"><span className="sr-only">Loading candidate assessments</span>{[0, 1, 2].map((row) => <div key={row} className="flex animate-pulse items-center gap-3 border-b border-[#f0f2f0] pb-4 last:border-0"><span className="size-9 rounded-full bg-[#edf1ed]" /><span className="h-3 w-36 rounded bg-[#edf1ed]" /><span className="ml-auto h-5 w-20 rounded-full bg-[#f2f4f2]" /></div>)}</div>}
+        {loading && <div role="status" className="space-y-3 px-5 py-5"><span className="sr-only">Loading candidate assessments</span>{[0, 1, 2].map((row) => <div key={row} className="flex items-center gap-3 border-b border-[#f0f2f0] pb-4 last:border-0"><SkeletonLoader className="size-9 shrink-0 rounded-full" /><SkeletonLoader className="h-3 w-36 rounded" /><SkeletonLoader className="ml-auto h-5 w-20 rounded-full" /></div>)}</div>}
         {!loading && filtered.map((candidate) => <Link key={candidate.id} to={`/candidates/${candidate.id}`} className="group grid gap-3 border-t border-[#f0f2f0] px-5 py-4 transition hover:bg-[#fbfdfb] sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
           <div className="flex min-w-0 items-center gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-full bg-[#edf4ee] text-[11px] font-semibold text-[#487453]">{candidate.name.split(" ").map((word) => word[0]).join("")}</span><div className="min-w-0"><div className="truncate text-[12px] font-semibold group-hover:text-[#39734d]">{candidate.name}</div><div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[#8e9992]"><span>{candidate.role}</span><span>·</span><span>{candidate.task_variant || "Skills assessment"}</span><span>·</span><span>{candidate.status === "In progress" ? "In progress" : new Date(candidate.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span><span><VerdictTone verdict={candidate.verdict} /></span></div></div></div>
           <div className="flex items-center justify-between gap-4 sm:justify-end"><ScoreRing score={candidate.score} size={48} /><span className="text-[10px] font-semibold text-[#477753] group-hover:underline">View report <ArrowRight className="ml-1 inline" size={12} /></span></div>
@@ -871,7 +975,14 @@ function CandidateDetail() {
     activityBuckets.set(minuteIndex, bucket);
   });
   const activityData = Array.from(activityBuckets.values()).sort((a, b) => Number.parseInt(a.minute) - Number.parseInt(b.minute));
-  const tabs = ["Overview", "Process replay", "Viva", "AI usage", "Live check", "Credential"];
+  const tabs = [
+    { label: "Overview", icon: LayoutDashboard },
+    { label: "Process replay", icon: Radio },
+    { label: "Viva", icon: MessageSquareText },
+    { label: "AI usage", icon: Sparkles },
+    { label: "Live check", icon: Code2 },
+    { label: "Credential", icon: BadgeCheck },
+  ];
   const scoreRows = [
     ["Viva understanding", components.viva, scoringConfig.weights.viva],
     ["Process pattern", components.process, scoringConfig.weights.process],
@@ -896,7 +1007,7 @@ function CandidateDetail() {
       <div className="flex items-center gap-4"><div className="flex items-center gap-3"><ScoreRing score={candidate.score} size={58} /><div><div className="text-[10px] text-[#8a968e]">Evidence score</div><div className="text-[12px] font-semibold">Weighted across signals</div></div></div>{candidate.credential_id && <button onClick={onCopy} className="inline-flex items-center gap-2 rounded-full border border-[#dce8df] px-3.5 py-2.5 text-[11px] font-semibold text-[#477753] hover:bg-[#f2f8f3]"><Copy size={13} />{copied ? "Copied" : "Copy credential link"}</button>}</div>
     </div>
     <div role="tablist" aria-label="Candidate evidence sections" className="mt-5 flex gap-1 overflow-x-auto rounded-2xl border border-[#e6ece7] bg-white p-1.5">
-      {tabs.map((tab) => <button key={tab} role="tab" aria-selected={activeTab === tab} onClick={() => setActiveTab(tab)} className={`shrink-0 rounded-xl px-4 py-2.5 text-[10px] font-semibold transition ${activeTab === tab ? "bg-[#1d3d2e] text-white" : "text-[#77847c] hover:bg-[#f5f8f5]"}`}>{tab}</button>)}
+      {tabs.map(({ label, icon: Icon }) => <button key={label} role="tab" title={label} aria-label={label} aria-selected={activeTab === label} onClick={() => setActiveTab(label)} className={`inline-flex shrink-0 items-center gap-1.5 rounded-xl px-3 py-2.5 text-[10px] font-semibold transition sm:px-4 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#426f4d] ${activeTab === label ? "bg-[#1d3d2e] text-white" : "text-[#77847c] hover:bg-[#f5f8f5]"}`}><Icon size={13} /><span>{label}</span></button>)}
     </div>
 
     {activeTab === "Overview" && <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,.8fr)]">
@@ -1026,7 +1137,7 @@ function Verification() {
       <p className="mt-3 max-w-[620px] text-[13px] leading-6 text-[#758078]">Enter a credential ID to confirm whether the candidate has a verified SkillProof assessment on file.</p>
       <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-3 sm:flex-row">
         <input value={credentialId} onChange={(event) => setCredentialId(event.target.value)} placeholder="e.g. sp-8f31c4" className="w-full rounded-full border border-[#e3e9e4] bg-[#fafcfb] px-4 py-3 text-[13px] outline-none transition focus:border-[#8db7a0] focus:ring-4 focus:ring-[#e8f4eb]" />
-        <button disabled={loading} className="rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#a9b8b0]">{loading ? "Checking…" : "Verify"}</button>
+        <button disabled={loading} className="primary-glow rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#a9b8b0]">{loading ? "Checking…" : "Verify"}</button>
       </form>
       {error && <p role="alert" className="mt-4 rounded-xl bg-[#fff5f3] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
       {candidate && <div className="mt-6 rounded-2xl border border-[#e6ece7] bg-[#f8faf8] p-5">
@@ -1095,7 +1206,7 @@ function Credential() {
         <div className="mt-8 grid gap-3 sm:grid-cols-3">{[["Skills verified", credential.skills.join(", ")], ["Issued", new Date(credential.issued_date).toLocaleDateString()], ["Assessment score", `${candidate.score} / 100`]].map(([label, value]) => <div key={label} className="rounded-xl bg-[#f7faf7] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8b9b8e]">{label}</div><div className="mt-1.5 text-[12px] font-semibold text-[#3d5043]">{value}</div></div>)}</div>
         <div className="mt-6 flex flex-col gap-5 rounded-xl border border-[#e7eee8] p-4 sm:flex-row sm:items-center"><div className="shrink-0 rounded-lg bg-white p-2"><QRCodeSVG value={verifyUrl} size={132} level="M" title="Scan to verify this SkillProof credential" /></div><div><h2 className="text-[12px] font-semibold text-[#435349]">Verify this credential</h2><p className="mt-1 text-[10px] leading-5 text-[#78867d]">Scan the QR code or use the public verification page to confirm this credential ID.</p><p className="mt-3 font-mono text-[10px] text-[#718078]">ID: {credential.credential_id}</p><p className="mt-2 text-[10px] leading-5 text-[#78867d]">{credential.evidence_summary}</p></div></div>
         <div className="mt-6 flex items-start gap-3 rounded-xl border border-[#e7eee8] p-4"><ShieldCheck size={16} className="mt-0.5 shrink-0 text-[#5a9367]" /><p className="text-[10px] leading-5 text-[#78867d]">Verified through a practical task, candidate-consented process evidence, and a viva about their own work. This credential confirms assessment participation and demonstrated understanding; it is not a guarantee of job performance.</p></div>
-        <div className="mt-7 flex flex-wrap items-center justify-between gap-3"><Link to={`/verify?credentialId=${encodeURIComponent(credential.credential_id)}`} className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Verify this credential <ExternalLink size={11} /></Link><div className="flex gap-2"><button onClick={copy} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-4 py-2.5 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]"><Copy size={13} />{copied ? "Copied" : "Copy link"}</button><button onClick={share} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d]">{shared ? <Check size={13} /> : <ExternalLink size={13} />}{shared ? "Shared" : "Share"}</button></div></div>
+        <div className="mt-7 flex flex-wrap items-center justify-between gap-3"><Link to={`/verify?credentialId=${encodeURIComponent(credential.credential_id)}`} className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Verify this credential <ExternalLink size={11} /></Link><div className="flex gap-2"><button onClick={copy} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-4 py-2.5 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]"><Copy size={13} />{copied ? "Copied" : "Copy link"}</button><button onClick={share} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d]">{shared ? <Check size={13} /> : <ExternalLink size={13} />}{shared ? "Shared" : "Share"}</button></div></div>
       </div>
     </div>}
     <p className="mt-6 text-center text-[10px] text-[#99a39b]"><Link to="/dashboard" className="hover:text-[#4c805a]">Back to hiring dashboard</Link></p>
@@ -1103,26 +1214,38 @@ function Credential() {
 }
 
 export default function App() {
-  const [isBooting, setIsBooting] = useState(true);
+  const location = useLocation();
+  const [settledLocationKey, setSettledLocationKey] = useState<string | null>(null);
 
   useEffect(() => {
-    const timer = window.setTimeout(() => setIsBooting(false), 1700);
+    const timer = window.setTimeout(() => setSettledLocationKey(location.key), 1500);
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [location.key]);
 
-  if (isBooting) {
-    return <LoadingScreen />;
-  }
-
-  return <Routes>
-    <Route path="/" element={<Home />} />
-    <Route path="/assessment" element={<Assessment />} />
-    <Route path="/viva/:id" element={<Viva />} />
-    <Route path="/live-check/:id" element={<LiveCheckChallenge />} />
-    <Route path="/dashboard" element={<Dashboard />} />
-    <Route path="/verify" element={<Verification />} />
-    <Route path="/candidates/:id" element={<CandidateDetail />} />
-    <Route path="/credential/:id" element={<Credential />} />
-    <Route path="*" element={<Navigate to="/" replace />} />
-  </Routes>;
+  return <>
+    <AnimatePresence mode="wait" initial={false}>
+      <motion.div
+        key={location.key}
+        initial={{ opacity: 0, y: 3 }}
+        animate={{ opacity: 1, y: 0 }}
+        exit={{ opacity: 0, y: -3 }}
+        transition={{ duration: 0.18, ease: "easeOut" }}
+      >
+        <Routes location={location}>
+          <Route path="/" element={<Home />} />
+          <Route path="/assessment" element={<Assessment />} />
+          <Route path="/viva/:id" element={<Viva />} />
+          <Route path="/live-check/:id" element={<LiveCheckChallenge />} />
+          <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/verify" element={<Verification />} />
+          <Route path="/candidates/:id" element={<CandidateDetail />} />
+          <Route path="/credential/:id" element={<Credential />} />
+          <Route path="*" element={<Navigate to="/" replace />} />
+        </Routes>
+      </motion.div>
+    </AnimatePresence>
+    <AnimatePresence>
+      {settledLocationKey !== location.key && <LoadingScreen key={location.key} />}
+    </AnimatePresence>
+  </>;
 }

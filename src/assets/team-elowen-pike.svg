@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" fill="none">
+  <defs>
+    <linearGradient id="bg" x1="12" y1="4" x2="114" y2="126" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F9DDE7"/>
+      <stop offset="1" stop-color="#E9A3B5"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0" cy="0" r="1" gradientTransform="matrix(0 59 -59 0 88 34)" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFF" stop-opacity=".62"/>
+      <stop offset="1" stop-color="#FFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="url(#bg)"/>
+  <rect width="128" height="128" rx="28" fill="url(#glow)"/>
+  <path d="M64 19v90M19 64h90" stroke="#fff" stroke-opacity=".24"/>
+  <circle cx="64" cy="64" r="37" stroke="#fff" stroke-opacity=".48"/>
+  <text x="64" y="75" fill="#77364D" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="31" font-weight="700" letter-spacing="-2" text-anchor="middle">EP</text>
+</svg>
