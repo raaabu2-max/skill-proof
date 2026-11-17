@@ -1,7 +1,8 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComponentProps, FormEvent, ReactNode } from "react";
 import Editor from "@monaco-editor/react";
-import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
+import { AnimatePresence, animate, motion, useInView, useMotionValue, useMotionValueEvent, useReducedMotion, useScroll, useTransform } from "framer-motion";
+import Lenis from "lenis";
 import { QRCodeSVG } from "qrcode.react";
 import ceoAvatar from "./assets/team-mira-solen.svg";
 import ctoAvatar from "./assets/team-tavian-ro.svg";
@@ -13,6 +14,7 @@ import {
   Eye, FileCode2, Flag, KeyRound, LayoutDashboard, Lightbulb, LockKeyhole, MessageSquareText, Plus,
   Radio, Shield, ShieldCheck, Sparkles, Upload, Users, WandSparkles, X,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "./lib/api";
 import type { Candidate, TaskVariant, TimelineEvent, VivaAnswer } from "./types";
@@ -36,8 +38,15 @@ function Logo({ small = false }: { small?: boolean }) {
 }
 
 function TopNav({ dashboard = false }: { dashboard?: boolean }) {
-  return <header className="top-nav sticky top-0 z-30 border-b backdrop-blur-xl">
-    <div className="mx-auto flex h-[68px] max-w-[1240px] items-center justify-between px-5 lg:px-8">
+  const { scrollY } = useScroll();
+  const [scrolled, setScrolled] = useState(false);
+  useMotionValueEvent(scrollY, "change", (latest) => {
+    const next = latest > 20;
+    setScrolled((current) => current === next ? current : next);
+  });
+
+  return <header className={`top-nav sticky top-0 z-30 border-b backdrop-blur-xl${scrolled ? " top-nav-scrolled" : ""}`}>
+    <div className={`top-nav-inner mx-auto flex ${scrolled ? "h-[62px]" : "h-[68px]"} max-w-[1240px] items-center justify-between px-5 lg:px-8`}>
       <Logo />
       {dashboard ? <nav aria-label="Hiring workspace" className="hidden items-center gap-1 md:flex">
         <Link to="/dashboard" title="Dashboard" aria-label="Dashboard" className="nav-active flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium"><LayoutDashboard size={16} /> Dashboard</Link>
@@ -169,9 +178,240 @@ function SkeletonLoader({ className = "" }: { className?: string }) {
   return <span aria-hidden="true" className={`skeleton-loader ${className}`} />;
 }
 
-function Home() {
+function ScrollReveal({ children, className = "", delay = 0 }: { children: ReactNode; className?: string; delay?: number }) {
   const reduceMotion = useReducedMotion();
-  const steps = [
+  const simpleFade = reduceMotion === true;
+  return <motion.div
+    className={className}
+    initial={{ opacity: 0, y: simpleFade ? 0 : 16, filter: simpleFade ? "blur(0px)" : "blur(6px)" }}
+    whileInView={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+    viewport={{ once: true, amount: 0.18 }}
+    transition={{ duration: simpleFade ? 0.2 : 0.55, delay: simpleFade ? 0 : delay, ease: "easeOut" }}
+  >
+    {children}
+  </motion.div>;
+}
+
+function ScrollEffects() {
+  const reduceMotion = useReducedMotion();
+  const { scrollYProgress } = useScroll();
+
+  useEffect(() => {
+    if (reduceMotion !== false) return;
+    const lenis = new Lenis({
+      anchors: true,
+      autoRaf: true,
+      lerp: 0.09,
+      respectReducedMotion: true,
+      smoothWheel: true,
+    });
+    return () => lenis.destroy();
+  }, [reduceMotion]);
+
+  return <motion.div className="scroll-progress" style={{ scaleX: scrollYProgress }} aria-hidden="true" />;
+}
+
+type HowStep = { number: string; icon: typeof ClipboardCheck; title: string; text: string; color: string };
+
+function StepTimelineItem({ step }: { step: HowStep }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const [centerMargin, setCenterMargin] = useState("-180px 0px -180px 0px");
+  const isActive = useInView(ref, { margin: centerMargin, amount: 0.15 });
+  const reduceMotion = useReducedMotion() === true;
+  const Icon = step.icon;
+
+  useEffect(() => {
+    const updateCenterMargin = () => {
+      const centerBand = Math.min(160, Math.round(window.innerHeight * 0.18));
+      const inset = Math.round((window.innerHeight - centerBand) / 2);
+      setCenterMargin(`-${inset}px 0px -${inset}px 0px`);
+    };
+    updateCenterMargin();
+    window.addEventListener("resize", updateCenterMargin);
+    return () => window.removeEventListener("resize", updateCenterMargin);
+  }, []);
+
+  return <motion.div
+    ref={ref}
+    className="step-timeline-item"
+    initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 18, scale: 0.98 }}
+    animate={reduceMotion
+      ? { opacity: isActive ? 1 : 0.72 }
+      : { opacity: isActive ? 1 : 0.72, y: isActive ? 0 : 5, scale: isActive ? 1 : 0.985 }}
+    transition={{ duration: reduceMotion ? 0.2 : 0.4, ease: "easeOut" }}
+  >
+    <span className={`steps-timeline-marker${isActive ? ` is-active${reduceMotion ? " is-reduced" : ""}` : ""}`} aria-hidden="true">{step.number}</span>
+    <article className={`step-card accent-${step.color}`}>
+      <div className="step-card-top"><span className="step-icon"><Icon size={19} /></span></div>
+      <h3>{step.title}</h3>
+      <p>{step.text}</p>
+      <div className="step-decoration" />
+    </article>
+  </motion.div>;
+}
+
+function StepsTimeline({ steps }: { steps: HowStep[] }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const { scrollYProgress } = useScroll({ target: ref, offset: ["start 75%", "end 40%"] });
+  const lineProgress = useTransform(scrollYProgress, [0, 1], [0, 1]);
+  const reduceMotion = useReducedMotion() === true;
+
+  return <div ref={ref} className="steps-grid">
+    <div className="steps-timeline-track" aria-hidden="true">
+      <motion.div className="steps-timeline-fill" style={{ scaleY: reduceMotion ? 1 : lineProgress }} />
+    </div>
+    {steps.map((step) => <StepTimelineItem key={step.number} step={step} />)}
+  </div>;
+}
+
+function CountUpStat({ value, label, delay }: { value: number; label: string; delay: number }) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const isInView = useInView(ref, { once: true, amount: 0.6 });
+  const count = useMotionValue(0);
+  const roundedCount = useTransform(count, (current) => Math.round(current));
+  const reduceMotion = useReducedMotion() === true;
+
+  useEffect(() => {
+    if (!isInView) return;
+    const controls = animate(count, value, { duration: reduceMotion ? 0 : 0.9, ease: "easeOut" });
+    return () => controls.stop();
+  }, [count, isInView, reduceMotion, value]);
+
+  return <motion.div
+    ref={ref}
+    className="stats-item"
+    initial={{ opacity: 0, y: reduceMotion ? 0 : 10 }}
+    whileInView={{ opacity: 1, y: 0 }}
+    viewport={{ once: true, amount: 0.6 }}
+    transition={{ duration: reduceMotion ? 0.2 : 0.4, delay: reduceMotion ? 0 : delay, ease: "easeOut" }}
+    aria-label={`${value} ${label}`}
+  >
+    <span className="stats-number" aria-hidden="true"><motion.span>{roundedCount}</motion.span></span>
+    <span className="stats-label">{label}</span>
+  </motion.div>;
+}
+
+function FeatureCard({ item, index }: { item: { icon: LucideIcon; title: string; text: string; accent: string }; index: number }) {
+  const reduceMotion = useReducedMotion() === true;
+  const Icon = item.icon;
+
+  return <motion.div
+    className="evidence-reveal"
+    initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 16, rotateX: 8, rotateY: index % 2 ? 6 : -6, scale: 0.97 }}
+    whileInView={reduceMotion
+      ? { opacity: 1 }
+      : { opacity: 1, y: 0, rotateX: 0, rotateY: 0, scale: 1 }}
+    viewport={{ once: true, amount: 0.22 }}
+    transition={{ duration: reduceMotion ? 0.2 : 0.46, delay: reduceMotion ? 0 : index * 0.035, ease: "easeOut" }}
+  >
+    <article
+      className={`evidence-card accent-${item.accent}`}
+      onMouseMove={(event) => {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        event.currentTarget.style.setProperty("--pointer-x", `${event.clientX - bounds.left}px`);
+        event.currentTarget.style.setProperty("--pointer-y", `${event.clientY - bounds.top}px`);
+      }}
+      onMouseLeave={(event) => {
+        event.currentTarget.style.setProperty("--pointer-x", "50%");
+        event.currentTarget.style.setProperty("--pointer-y", "50%");
+      }}
+    >
+      <span className="evidence-icon"><Icon size={17} /></span><span className="evidence-index">0{index + 1}</span><h3>{item.title}</h3><p>{item.text}</p><ArrowRight className="evidence-arrow" size={16} />
+    </article>
+  </motion.div>;
+}
+
+function BeforeAfterSection() {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const isInView = useInView(ref, { once: true, amount: 0.25 });
+  const reduceMotion = useReducedMotion() === true;
+  const beforeItems = [
+    "One polished output leaves the process out",
+    "AI activity can be misread in isolation",
+    "Generic tasks miss how someone adapts",
+  ];
+  const afterItems = [
+    "Practical work shows the candidate's approach",
+    "Process and AI use are reviewed in context",
+    "Human reviewers consider multiple signals",
+  ];
+
+  return <section className="comparison-section" aria-labelledby="comparison-heading">
+    <ScrollReveal className="comparison-heading">
+      <span className="section-kicker">A CLEARER WAY TO SEE SKILL</span>
+      <h2 id="comparison-heading">Beyond a single answer.</h2>
+      <p>Good decisions come from context, process, and human review.</p>
+    </ScrollReveal>
+    <div ref={ref} className="before-after-grid">
+      <motion.article
+        className="comparison-card comparison-before"
+        initial={reduceMotion ? { opacity: 0 } : { opacity: 0, x: -34 }}
+        animate={isInView ? { opacity: 1, x: 0 } : undefined}
+        transition={{ duration: reduceMotion ? 0.2 : 0.54, ease: "easeOut" }}
+      >
+        <span className="comparison-kicker">BEFORE</span>
+        <h3>A snapshot, not the story</h3>
+        <ul>{beforeItems.map((item) => <li key={item}><X size={14} aria-hidden="true" />{item}</li>)}</ul>
+      </motion.article>
+      <div className={`before-after-divider${reduceMotion ? " is-reduced" : ""}`} aria-hidden="true">
+        <motion.span className="before-after-divider-vertical" initial={reduceMotion ? { opacity: 0 } : { scaleY: 0 }} animate={reduceMotion ? { opacity: isInView ? 1 : 0 } : { scaleY: isInView ? 1 : 0 }} transition={{ duration: reduceMotion ? 0.2 : 0.68, ease: "easeInOut" }} />
+        <motion.span className="before-after-divider-horizontal" initial={reduceMotion ? { opacity: 0 } : { scaleX: 0 }} animate={reduceMotion ? { opacity: isInView ? 1 : 0 } : { scaleX: isInView ? 1 : 0 }} transition={{ duration: reduceMotion ? 0.2 : 0.68, ease: "easeInOut" }} />
+      </div>
+      <motion.article
+        className="comparison-card comparison-after"
+        initial={reduceMotion ? { opacity: 0 } : { opacity: 0, x: 34 }}
+        animate={isInView ? { opacity: 1, x: 0 } : undefined}
+        transition={{ duration: reduceMotion ? 0.2 : 0.54, delay: reduceMotion ? 0 : 0.08, ease: "easeOut" }}
+      >
+        <span className="comparison-kicker">WITH SKILLPROOF</span>
+        <h3>A fuller view of real skill</h3>
+        <ul>{afterItems.map((item) => <li key={item}><Check size={14} aria-hidden="true" />{item}</li>)}</ul>
+      </motion.article>
+    </div>
+  </section>;
+}
+
+function FinalCta() {
+  const ref = useRef<HTMLDivElement | null>(null);
+  const isInView = useInView(ref, { once: true, amount: 0.35 });
+  const reduceMotion = useReducedMotion() === true;
+
+  return <section className="final-cta-section" aria-label="Get started with SkillProof">
+    <motion.div
+      ref={ref}
+      className="final-cta-banner"
+      initial={reduceMotion ? { opacity: 0 } : { opacity: 0, scale: 0.96 }}
+      animate={isInView ? { opacity: 1, scale: 1 } : undefined}
+      transition={{ duration: reduceMotion ? 0.2 : 0.54, ease: "easeOut" }}
+    >
+      <motion.div
+        className="final-cta-gradient"
+        initial={{ backgroundPosition: "0% 50%" }}
+        animate={isInView && !reduceMotion ? { backgroundPosition: "100% 50%" } : undefined}
+        transition={{ duration: 0.72, ease: "easeOut" }}
+        aria-hidden="true"
+      />
+      <div className="final-cta-copy">
+        <span className="final-cta-kicker">READY TO SEE THE WHOLE STORY?</span>
+        <h2>Make room for real skill.</h2>
+        <p>Explore a practical, human-first way to understand how candidates work.</p>
+      </div>
+      <Link to="/assessment" className="final-cta-link">Try the live demo <ArrowRight size={16} /></Link>
+    </motion.div>
+  </section>;
+}
+
+function Home() {
+  const heroRef = useRef<HTMLElement | null>(null);
+  const { scrollYProgress: heroProgress } = useScroll({ target: heroRef, offset: ["start start", "end start"] });
+  const headlineOpacity = useTransform(heroProgress, [0, 0.72], [1, 0]);
+  const headlineScale = useTransform(heroProgress, [0, 0.72], [1, 0.95]);
+  const mockupY = useTransform(heroProgress, [0, 1], [0, -76]);
+  const visualY = useTransform(heroProgress, [0, 1], [0, -36]);
+  const processNoteY = useTransform(heroProgress, [0, 1], [0, -112]);
+  const scoreNoteY = useTransform(heroProgress, [0, 1], [0, -22]);
+  const reduceMotion = useReducedMotion() === true;
+  const steps: HowStep[] = [
     { number: "01", icon: ClipboardCheck, title: "A real task", text: "Candidates work on the same practical challenge in a focused workspace.", color: "mint" },
     { number: "02", icon: Radio, title: "Process, not just output", text: "With consent, see how an idea takes shape through edits and decisions.", color: "pink" },
     { number: "03", icon: MessageSquareText, title: "A thoughtful viva", text: "Candidates explain their choices and edge cases in their own words.", color: "yellow" },
@@ -194,9 +434,9 @@ function Home() {
   return <div className="landing-page min-h-screen">
     <TopNav />
     <main>
-      <section className="landing-hero">
-        <div className="landing-hero-inner">
-          <div className="hero-copy animate-rise">
+      <section ref={heroRef} className="landing-hero">
+        <ScrollReveal className="landing-hero-inner">
+          <motion.div className="hero-copy" style={reduceMotion ? { opacity: headlineOpacity } : { opacity: headlineOpacity, scale: headlineScale }}>
             <div className="hero-eyebrow"><span /> THE HUMAN SIDE OF TECH HIRING</div>
             <h1>See the thinking.<br />Meet the <span>real talent.</span></h1>
             <p>Great hiring is more than a perfect answer. SkillProof brings the process, reasoning, and practical skill into one clear picture — with AI treated as a tool, not a verdict.</p>
@@ -208,11 +448,12 @@ function Home() {
               <div className="avatar-stack"><span>M</span><span>L</span><span>A</span><span>+</span></div>
               <div><strong>Better signal, fairer hiring</strong><small>Designed for real people, not perfect prompts.</small></div>
             </div>
-          </div>
-          <div className="hero-visual animate-rise">
+          </motion.div>
+          <motion.div className="hero-visual" style={reduceMotion ? undefined : { y: visualY }}>
             <div className="visual-orbit orbit-pink" />
             <div className="visual-orbit orbit-teal" />
-            <div className="floating-note note-process"><span className="live-dot" /><div><strong>Process replay</strong><small>Thoughtful edits · 18 min</small></div><Radio size={17} /></div>
+            <motion.div className="floating-note note-process" style={reduceMotion ? undefined : { y: processNoteY }}><span className="live-dot" /><div><strong>Process replay</strong><small>Thoughtful edits · 18 min</small></div><Radio size={17} /></motion.div>
+            <motion.div className="product-window-parallax" style={reduceMotion ? undefined : { y: mockupY }}>
             <div className="product-window">
               <div className="window-topbar"><div className="window-dots"><i /><i /><i /></div><span>SKILLPROOF / CANDIDATE WORKSPACE</span><span className="window-secure"><ShieldCheck size={12} /> PRIVATE</span></div>
               <div className="product-content">
@@ -228,71 +469,70 @@ function Home() {
               </div>
               <div className="product-bottom"><span>ASSESSMENT SIGNALS</span><div><i className="signal-green" /><i className="signal-pink" /><i className="signal-yellow" /><i className="signal-blue" /></div><strong>4 signals in context</strong></div>
             </div>
-            <div className="floating-note note-score"><span className="score-orb"><Sparkles size={16} /></span><div><small>Understanding score</small><strong>92 <em>/ 100</em></strong></div><span className="score-trend">+12%</span></div>
+            </motion.div>
+            <motion.div className="floating-note note-score" style={reduceMotion ? undefined : { y: scoreNoteY }}><span className="score-orb"><Sparkles size={16} /></span><div><small>Understanding score</small><strong>92 <em>/ 100</em></strong></div><span className="score-trend">+12%</span></motion.div>
             <div className="visual-caption"><span>01</span> A clearer view of real skill <i /></div>
-          </div>
-        </div>
+          </motion.div>
+        </ScrollReveal>
       </section>
       <section className="brand-strip" aria-label="SkillProof principles">
-        <div><span>BUILT FOR BETTER HIRING</span><strong>Human-first</strong><i /> <strong>Evidence-led</strong><i /> <strong>AI-aware</strong><i /> <strong>Fair by design</strong></div>
+        <ScrollReveal><span>BUILT FOR BETTER HIRING</span><strong>Human-first</strong><i /> <strong>Evidence-led</strong><i /> <strong>AI-aware</strong><i /> <strong>Fair by design</strong></ScrollReveal>
+      </section>
+      <section className="stats-strip" aria-label="SkillProof at a glance">
+        <ScrollReveal className="stats-grid">
+          <CountUpStat value={6} label="Assessment signals" delay={0} />
+          <CountUpStat value={4} label="Assessment stages" delay={0.1} />
+          <CountUpStat value={0} label="AI-text scoring points" delay={0.2} />
+        </ScrollReveal>
       </section>
 
       <section id="how-it-works" className="how-section">
-        <div className="section-heading">
+        <ScrollReveal className="section-heading">
           <div><span className="section-kicker">FROM FIRST LINE TO FULL PICTURE</span><h2>A better way to<br /><span>see what people can do.</span></h2></div>
           <p>One polished answer can’t tell the whole story. We bring together practical work, real reasoning, and human review.</p>
-        </div>
-        <div className="steps-grid">{steps.map(({ number, icon: Icon, title, text, color }) => <article key={number} className={`step-card accent-${color}`}>
-          <div className="step-card-top"><span className="step-icon"><Icon size={19} /></span><span>{number}</span></div>
-          <h3>{title}</h3><p>{text}</p><div className="step-decoration" />
-        </article>)}</div>
+        </ScrollReveal>
+        <StepsTimeline steps={steps} />
       </section>
 
       <section id="features" className="evidence-section">
-        <div className="evidence-heading"><span className="section-kicker">THE WHOLE STORY, NOT JUST THE SUBMISSION</span><h2>Six signals.<br /><span>One human decision.</span></h2><p>Each signal adds context. None is treated as proof of authorship or a standalone hiring decision.</p></div>
-        <div className="evidence-grid">{evidence.map(({ icon: Icon, title, text, accent }, index) => <article key={title} className={`evidence-card accent-${accent}`}>
-          <span className="evidence-icon"><Icon size={17} /></span><span className="evidence-index">0{index + 1}</span><h3>{title}</h3><p>{text}</p><ArrowRight className="evidence-arrow" size={16} />
-        </article>)}</div>
-        <div className="fairness-note"><span className="fairness-icon"><ShieldCheck size={18} /></span><p><strong>AI use is context, not a verdict.</strong> We never reject candidates based on AI activity alone. Review the evidence, then make a fair, informed decision.</p><Link to="/dashboard">How we keep it fair <ArrowRight size={14} /></Link></div>
+        <ScrollReveal className="evidence-heading"><span className="section-kicker">THE WHOLE STORY, NOT JUST THE SUBMISSION</span><h2>Six signals.<br /><span>One human decision.</span></h2><p>Each signal adds context. None is treated as proof of authorship or a standalone hiring decision.</p></ScrollReveal>
+        <ScrollReveal className="evidence-grid">{evidence.map((item, index) => <FeatureCard key={item.title} item={item} index={index} />)}</ScrollReveal>
+        <ScrollReveal className="fairness-note"><span className="fairness-icon"><ShieldCheck size={18} /></span><p><strong>AI use is context, not a verdict.</strong> We never reject candidates based on AI activity alone. Review the evidence, then make a fair, informed decision.</p><Link to="/dashboard">How we keep it fair <ArrowRight size={14} /></Link></ScrollReveal>
       </section>
 
+      <BeforeAfterSection />
+
       <section id="principles" className="principles-section">
-        <div className="principles-copy"><span className="section-kicker">DESIGNED AROUND PEOPLE</span><h2>Make room for<br /><span>the human part.</span></h2><p>Candidates deserve a chance to show how they think. Hiring teams deserve evidence they can actually discuss.</p><Link to="/dashboard" className="principles-link">Explore the hiring workspace <ArrowRight size={15} /></Link></div>
-        <div className="principles-card">
+        <ScrollReveal className="principles-copy"><span className="section-kicker">DESIGNED AROUND PEOPLE</span><h2>Make room for<br /><span>the human part.</span></h2><p>Candidates deserve a chance to show how they think. Hiring teams deserve evidence they can actually discuss.</p><Link to="/dashboard" className="principles-link">Explore the hiring workspace <ArrowRight size={15} /></Link></ScrollReveal>
+        <ScrollReveal className="principles-card">
           <div className="principles-card-head"><span className="principles-emblem"><Users size={18} /></span><div><strong>Fairness, built in</strong><small>A more thoughtful candidate experience</small></div><span className="principles-live">LIVE</span></div>
           <div className="fair-step"><span>01</span><div><strong>Clear from the start</strong><small>Candidates know what is collected and why.</small></div><BadgeCheck size={18} /></div>
           <div className="fair-step"><span>02</span><div><strong>AI is never the judge</strong><small>Human review stays at the center.</small></div><ShieldCheck size={18} /></div>
           <div className="fair-step"><span>03</span><div><strong>Evidence, not surveillance</strong><small>No camera, microphone, or browsing history.</small></div><Eye size={18} /></div>
           <div className="principles-card-foot"><span><i /> TRUST BY DESIGN</span><span>SKILLPROOF · 2026</span></div>
-        </div>
+        </ScrollReveal>
       </section>
       <section className="team-section" aria-labelledby="team-heading">
-        <div className="team-heading">
+        <ScrollReveal className="team-heading">
           <span className="section-kicker">THE PEOPLE BEHIND THE PLATFORM</span>
           <h2 id="team-heading">Meet the team</h2>
           <p>A small, fictional team built around thoughtful, evidence-led hiring.</p>
-        </div>
-        <div className="team-grid">
-          {team.map(({ name, role, bio, avatar }, index) => <motion.article
-            key={name}
-            className="team-card"
-            initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 14 }}
-            whileInView={{ opacity: 1, y: 0 }}
-            viewport={{ once: true, amount: 0.2 }}
-            transition={{ duration: reduceMotion ? 0.2 : 0.45, delay: reduceMotion ? 0 : index * 0.08 }}
-          >
+        </ScrollReveal>
+        <ScrollReveal className="team-grid">{team.map(({ name, role, bio, avatar }, index) => <ScrollReveal key={name} className="scroll-reveal-item" delay={index * 0.07}>
+          <article className="team-card">
             <img className="team-avatar" src={avatar} alt="" aria-hidden="true" />
             <div className="team-card-copy">
               <h3>{name}</h3>
               <p className="team-role">{role}</p>
               <p className="team-bio">{bio}</p>
             </div>
-          </motion.article>)}
-        </div>
-        <p className="team-footnote">Illustrative team for demo purposes.</p>
+          </article>
+        </ScrollReveal>)}</ScrollReveal>
+        <ScrollReveal className="team-footnote">Illustrative team for demo purposes.</ScrollReveal>
       </section>
+      <FinalCta />
     </main>
-    <footer className="landing-footer"><div><Logo /><span>Clear evidence. Fairer conversations. Better hiring.</span><span>© {new Date().getFullYear()} SkillProof</span></div></footer>
+    <footer className="landing-footer"><ScrollReveal><Logo /><span>Clear evidence. Fairer conversations. Better hiring.</span><span>© {new Date().getFullYear()} SkillProof</span></ScrollReveal></footer>
   </div>;
 }
 
@@ -1223,6 +1463,7 @@ export default function App() {
   }, [location.key]);
 
   return <>
+    <ScrollEffects />
     <AnimatePresence mode="wait" initial={false}>
       <motion.div
         key={location.key}
