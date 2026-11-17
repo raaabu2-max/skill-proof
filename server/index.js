@@ -4,13 +4,22 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { scoreCandidate } from "../shared/scoring.js";
+import { scoreCandidate, scoreTrackResult } from "../shared/scoring.js";
 import { scoringConfig } from "../shared/scoring-config.js";
+import {
+  chooseTrackVariant,
+  findTrackVariant,
+  getTrack,
+  tracksConfig,
+} from "../shared/tracks.config.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const dataDir = resolve(here, "../data");
-mkdirSync(dataDir, { recursive: true });
-const db = new Database(resolve(dataDir, "skillproof.db"));
+const databasePath = process.env.SKILLPROOF_DB_PATH
+  ? resolve(process.env.SKILLPROOF_DB_PATH)
+  : resolve(dataDir, "skillproof.db");
+mkdirSync(dirname(databasePath), { recursive: true });
+const db = new Database(databasePath);
 db.pragma("journal_mode = WAL");
 db.exec(`
   CREATE TABLE IF NOT EXISTS candidates (
@@ -21,6 +30,7 @@ db.exec(`
     code TEXT DEFAULT '', events TEXT DEFAULT '[]', ai_prompts TEXT DEFAULT '[]',
     viva TEXT DEFAULT '[]', flags TEXT DEFAULT '[]', credential_id TEXT,
     live_check TEXT DEFAULT NULL, session_id TEXT, task_variant TEXT,
+    track TEXT NOT NULL DEFAULT 'skill', domain TEXT NOT NULL DEFAULT 'javascript',
     consented_at TEXT, extra_time INTEGER NOT NULL DEFAULT 0,
     verdict_reason TEXT, flag_details TEXT DEFAULT '[]', ai_text_note TEXT,
     scoring_components TEXT DEFAULT '{}'
@@ -31,6 +41,8 @@ db.exec(`
     started_at TEXT NOT NULL,
     consented_at TEXT NOT NULL,
     task_variant TEXT NOT NULL,
+    track TEXT NOT NULL DEFAULT 'skill',
+    domain TEXT NOT NULL DEFAULT 'javascript',
     extra_time INTEGER NOT NULL DEFAULT 0,
     requirement_change_seen INTEGER NOT NULL DEFAULT 0,
     requirement_change_at TEXT,
@@ -83,6 +95,21 @@ db.exec(`
     skills TEXT NOT NULL DEFAULT '[]',
     evidence_summary TEXT NOT NULL DEFAULT ''
   );
+  CREATE TABLE IF NOT EXISTS track_results (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+    track TEXT NOT NULL,
+    domain TEXT NOT NULL,
+    task_variant TEXT NOT NULL,
+    score INTEGER NOT NULL,
+    signals TEXT NOT NULL,
+    evidence TEXT NOT NULL DEFAULT '{}',
+    submitted_at TEXT NOT NULL,
+    UNIQUE(session_id, track)
+  );
+  CREATE INDEX IF NOT EXISTS idx_track_results_candidate_track
+    ON track_results(candidate_id, track);
 `);
 const candidateColumns = new Set(db.prepare("PRAGMA table_info(candidates)").all().map((column) => column.name));
 const addCandidateColumn = (name, definition) => {
@@ -98,6 +125,11 @@ addCandidateColumn("verdict_reason", "TEXT");
 addCandidateColumn("flag_details", "TEXT DEFAULT '[]'");
 addCandidateColumn("ai_text_note", "TEXT");
 addCandidateColumn("scoring_components", "TEXT DEFAULT '{}'");
+addCandidateColumn("track", "TEXT NOT NULL DEFAULT 'skill'");
+addCandidateColumn("domain", "TEXT NOT NULL DEFAULT 'javascript'");
+const sessionColumns = new Set(db.prepare("PRAGMA table_info(sessions)").all().map((column) => column.name));
+if (!sessionColumns.has("track")) db.exec("ALTER TABLE sessions ADD COLUMN track TEXT NOT NULL DEFAULT 'skill'");
+if (!sessionColumns.has("domain")) db.exec("ALTER TABLE sessions ADD COLUMN domain TEXT NOT NULL DEFAULT 'javascript'");
 
 const requirementChangeDelay = process.env.REQUIREMENT_CHANGE_DELAY_MS === undefined
   ? 180000
@@ -106,37 +138,22 @@ if (!Number.isInteger(requirementChangeDelay) || requirementChangeDelay < 1000 |
   throw new Error("REQUIREMENT_CHANGE_DELAY_MS must be an integer from 1000 to 3600000.");
 }
 
-const taskVariants = [
-  {
-    id: "group-by-region",
-    title: "Group records by region",
-    description: "Complete groupByRegion(records). Group every record by its region, including records with a missing region.",
-    field: "region",
-    dataset: [{ region: "north", name: "A" }, { region: "south", name: "B" }, { name: "C" }],
-    thresholds: { minEditEvents: 3, maxPasteCharacters: 500 },
-  },
-  {
-    id: "group-by-status",
-    title: "Group tickets by status",
-    description: "Complete groupByStatus(tickets). Keep every ticket and account for empty values and special object keys.",
-    field: "status",
-    dataset: [{ status: "open", id: 1 }, { status: "closed", id: 2 }, { status: "__proto__", id: 3 }],
-    thresholds: { minEditEvents: 3, maxPasteCharacters: 500 },
-  },
-  {
-    id: "group-by-category",
-    title: "Group products by category",
-    description: "Complete groupByCategory(products). Group categories and decide how to represent missing category values.",
-    field: "category",
-    dataset: [{ category: "books", sku: "B1" }, { category: "tools", sku: "T1" }, { sku: "U1" }],
-    thresholds: { minEditEvents: 3, maxPasteCharacters: 500 },
-  },
-];
-
-function variantForCandidate(candidateId) {
+function stableSeed(value) {
   let hash = 0;
-  for (const character of candidateId) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
-  return taskVariants[hash % taskVariants.length];
+  for (const character of String(value)) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return hash;
+}
+
+function variantForCandidate(candidateId, track = "skill", domain = "javascript") {
+  return chooseTrackVariant(track, domain, stableSeed(candidateId));
+}
+
+function starterForVariant(variant) {
+  if (typeof variant?.starter === "string") return variant.starter;
+  if (variant?.field) {
+    return `function groupBy${variant.field[0].toUpperCase()}${variant.field.slice(1)}(items) {\n  return items.reduce((groups, item) => {\n    const value = item.${variant.field};\n    (groups[value] ??= []).push(item);\n    return groups;\n  }, {});\n}`;
+  }
+  return "";
 }
 
 const demos = [
@@ -263,7 +280,8 @@ const migrateLegacyEvidence = db.transaction(() => {
     insertSession.run(sessionId, row.id, createdAt, row.consented_at || createdAt, taskVariant,
       row.extra_time ? 1 : 0, requirementChangeSeen ? 1 : 0,
       requirementChangeSeen ? createdAt : null);
-    db.prepare(`UPDATE candidates SET session_id=?,task_variant=?,consented_at=COALESCE(consented_at,?)
+    db.prepare(`UPDATE candidates SET session_id=?,task_variant=?,track=COALESCE(NULLIF(track,''),'skill'),
+      domain=COALESCE(NULLIF(domain,''),'javascript'),consented_at=COALESCE(consented_at,?)
       WHERE id=?`).run(sessionId, taskVariant, createdAt, row.id);
     candidateEvents.forEach((event, index) => {
       const [minutes = 0, seconds = 0] = String(event.time || "00:00").split(":").map(Number);
@@ -296,6 +314,104 @@ const migrateLegacyEvidence = db.transaction(() => {
   }
 });
 migrateLegacyEvidence();
+
+// Keep demo candidate summary scores and verdicts intact; attach representative
+// evidence for every track so reports and track-aware API consumers have data.
+const demoTrackEvidence = {
+  "maya-chen": {
+    "problem-solver": { explanation: "Explained the tax, rounding, and empty-cart defects; all three failing checks passed after the repair.", bugs_found: 3, tests_passed: 3, tests_total: 3, test_runs: 4, time_to_first_fix_seconds: 184 },
+    skill: { explanation: "Delivered a complete grouping solution, checked missing and special keys, and clearly defended the trade-offs.", build_checks_passed: 3, build_checks_total: 3, viva_answers: 5, edited_iteratively: true },
+    adapt: { explanation: "Applied the changed missing-value requirement, tested assistant guidance, caught the unsafe-key suggestion, and verified the revised output.", requirement_change_seen: true, assistant_answers_tested: 2, assistant_mistakes_caught: 1, output_edited: true, tests_passed: 3, tests_total: 3 },
+  },
+  "leo-martin": {
+    "problem-solver": { explanation: "Found the main defect and explained the fix; all core checks passed with one extra iteration.", bugs_found: 2, tests_passed: 3, tests_total: 3, test_runs: 5, time_to_first_fix_seconds: 296 },
+    skill: { explanation: "Produced a reasonable first solution, but left some edge cases and parts of the viva explanation incomplete.", build_checks_passed: 2, build_checks_total: 3, viva_answers: 3, edited_iteratively: true },
+    adapt: { explanation: "Acknowledged the changed requirement and revised the work, but the final verification was partial.", requirement_change_seen: true, assistant_answers_tested: 1, assistant_mistakes_caught: 0, output_edited: true, tests_passed: 2, tests_total: 3 },
+  },
+  "amara-okafor": {
+    "problem-solver": { explanation: "The original defects remained in the submitted solution; no failing checks were recorded as passing.", bugs_found: 0, tests_passed: 0, tests_total: 3, test_runs: 1, time_to_first_fix_seconds: null },
+    skill: { explanation: "The submitted work was incomplete and did not demonstrate a verified solution or a complete defense.", build_checks_passed: 0, build_checks_total: 3, viva_answers: 1, edited_iteratively: false },
+    adapt: { explanation: "The output did not reflect the changed requirement, and there is no evidence of testing or catching the assistant mistake.", requirement_change_seen: false, assistant_answers_tested: 0, assistant_mistakes_caught: 0, output_edited: false, tests_passed: 0, tests_total: 3 },
+  },
+};
+const demoTrackSignals = {
+  "maya-chen": {
+    "problem-solver": { viva: 94, process: 90, aiUsage: 92, liveCheck: 96, timeAndPaste: 86 },
+    skill: { viva: 92, process: 88, aiUsage: 94, liveCheck: 95, timeAndPaste: 85 },
+    adapt: { viva: 91, process: 93, aiUsage: 97, liveCheck: 95, timeAndPaste: 84 },
+  },
+  "leo-martin": {
+    "problem-solver": { viva: 82, process: 76, aiUsage: 72, liveCheck: 84, timeAndPaste: 70 },
+    skill: { viva: 62, process: 60, aiUsage: 68, liveCheck: 65, timeAndPaste: 58 },
+    adapt: { viva: 58, process: 64, aiUsage: 62, liveCheck: 60, timeAndPaste: 55 },
+  },
+  "amara-okafor": {
+    "problem-solver": { viva: 24, process: 22, aiUsage: 30, liveCheck: 20, timeAndPaste: 25 },
+    skill: { viva: 28, process: 24, aiUsage: 32, liveCheck: 26, timeAndPaste: 24 },
+    adapt: { viva: 22, process: 28, aiUsage: 24, liveCheck: 20, timeAndPaste: 23 },
+  },
+};
+const insertTrackResult = db.prepare(`INSERT OR IGNORE INTO track_results
+  (id,session_id,candidate_id,track,domain,task_variant,score,signals,evidence,submitted_at)
+  VALUES (?,?,?,?,?,?,?,?,?,?)
+  ON CONFLICT(session_id,track) DO UPDATE SET
+    domain=excluded.domain,task_variant=excluded.task_variant,score=excluded.score,
+    signals=excluded.signals,evidence=excluded.evidence,submitted_at=excluded.submitted_at`);
+function seededSignalEvidence(signals, evidence) {
+  const firstFix = evidence.time_to_first_fix_seconds;
+  const passed = evidence.tests_passed ?? evidence.build_checks_passed;
+  const total = evidence.tests_total ?? evidence.build_checks_total;
+  return {
+    viva: evidence.viva_answers === undefined
+      ? "The score reflects how clearly the candidate explained their decisions and edge cases."
+      : `Answered ${evidence.viva_answers} viva questions; reasoning was reviewed against the submitted work.`,
+    process: evidence.test_runs === undefined
+      ? "The candidate's step-by-step work and iteration were reviewed in context."
+      : `Recorded ${evidence.test_runs} test runs while investigating and repairing the task.`,
+    aiUsage: evidence.assistant_answers_tested === undefined
+      ? "AI use was considered in context; using an assistant is not penalized."
+      : `Tested ${evidence.assistant_answers_tested} assistant answers and identified ${evidence.assistant_mistakes_caught} potential mistakes.`,
+    liveCheck: passed === undefined
+      ? `The live-check evidence was rated ${signals.liveCheck}/100.`
+      : `Passed ${passed} of ${total} task checks.`,
+    timeAndPaste: firstFix === null || firstFix === undefined
+      ? "Time and pasted work are supporting context, not proof by themselves."
+      : `First passing fix was recorded after ${Math.floor(firstFix / 60)}m ${firstFix % 60}s.`,
+  };
+}
+const seedDemoTrackResults = db.transaction(() => {
+  for (const demo of demos) {
+    const candidate = db.prepare("SELECT session_id FROM candidates WHERE id = ?").get(demo.id);
+    if (!candidate?.session_id) continue;
+    for (const track of Object.values(tracksConfig.tracks)) {
+      const domain = track.domains.find((candidateDomain) => track.tasks.some((task) => task.domain === candidateDomain));
+      if (!domain) continue;
+      const variant = variantForCandidate(demo.id, track.id, domain);
+      if (!variant) continue;
+      const signals = demoTrackSignals[demo.id]?.[track.id];
+      if (!signals) continue;
+      const evidence = demoTrackEvidence[demo.id]?.[track.id] || {};
+      const result = scoreTrackResult({ track: track.id, domain, signals, evidence });
+      insertTrackResult.run(
+        `seed:${demo.id}:${track.id}`,
+        candidate.session_id,
+        demo.id,
+        track.id,
+        domain,
+        variant.id,
+        result.score,
+        JSON.stringify(signals),
+        JSON.stringify({
+          source: "seeded-demo",
+          ...evidence,
+          signalEvidence: seededSignalEvidence(signals, evidence),
+        }),
+        demo.created_at || new Date().toISOString(),
+      );
+    }
+  }
+});
+seedDemoTrackResults();
 
 function detectsCorrection(code) {
   return /\bObject\.create\s*\(\s*null\s*\)|\bObject\.hasOwn\s*\(|\bhasOwnProperty\s*\.\s*call\s*\(|\bnew\s+Map\s*\(/.test(code);
@@ -339,7 +455,7 @@ function resolvePromptEvidence(sessionId, prompts, code) {
       caught: Boolean(stored?.caught || corrected),
       edited_after: Boolean(stored?.edited_after || corrected),
       summary: stored?.seeded_mistake
-        ? "Demo assistant suggestion contains a seeded object-key mistake; review whether the candidate verified or corrected it."
+        ? "Assistant suggestion contains a seeded task-specific mistake; review whether the candidate verified or corrected it."
         : prompt.summary || "Assistant response available as context for the reviewer.",
     };
   });
@@ -357,7 +473,7 @@ function resolvePromptEvidence(sessionId, prompts, code) {
       caught: Boolean(stored.caught || corrected),
       edited_after: Boolean(stored.edited_after || corrected),
       summary: stored.seeded_mistake
-        ? "Demo assistant suggestion contains a seeded object-key mistake; review whether the candidate verified or corrected it."
+        ? "Assistant suggestion contains a seeded task-specific mistake; review whether the candidate verified or corrected it."
         : "Assistant response available as context for the reviewer.",
     });
   }
@@ -395,12 +511,29 @@ if (retentionDays > 0) {
     const result = statement.run(...demos.map((demo) => demo.id), cutoff);
     if (result.changes) console.log(`Removed ${result.changes} expired candidate record(s).`);
   };
-  purgeExpiredCandidates();
-  setInterval(purgeExpiredCandidates, 24 * 60 * 60 * 1000).unref();
+  const runRetentionCleanup = () => {
+    try {
+      purgeExpiredCandidates();
+    } catch (error) {
+      console.error("Assessment retention cleanup failed; the API remains available.", error);
+    }
+  };
+  runRetentionCleanup();
+  setInterval(runRetentionCleanup, 24 * 60 * 60 * 1000).unref();
 }
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
+function readTrackResults(candidateId) {
+  return db.prepare(`SELECT track,domain,task_variant,score,signals,evidence,submitted_at
+    FROM track_results WHERE candidate_id = ? ORDER BY submitted_at, track`).all(candidateId)
+    .map((row) => ({
+      ...row,
+      signals: JSON.parse(row.signals),
+      evidence: JSON.parse(row.evidence),
+    }));
+}
+
 const parseCandidate = (row) => {
   if (!row) return row;
   const parsed = {
@@ -408,6 +541,7 @@ const parseCandidate = (row) => {
     viva: JSON.parse(row.viva), flags: JSON.parse(row.flags),
     flag_details: JSON.parse(row.flag_details || "[]"),
     live_check: row.live_check ? JSON.parse(row.live_check) : null,
+    track_results: readTrackResults(row.id),
   };
   const computed = scoreCandidate({
     viva: parsed.viva,
@@ -425,8 +559,32 @@ const parseCandidate = (row) => {
   };
 };
 
+function publicTrackVariant(variant) {
+  const { seed, hiddenBugs, seededAssistantMistakes, ...publicVariant } = variant;
+  return publicVariant;
+}
+
+function publicTracksCatalog() {
+  return {
+    version: tracksConfig.version,
+    trackWeights: tracksConfig.trackWeights,
+    domains: tracksConfig.domains,
+    tracks: Object.fromEntries(Object.entries(tracksConfig.tracks).map(([id, track]) => [id, {
+      id: track.id,
+      title: track.title,
+      description: track.description,
+      domains: track.domains,
+      tasks: track.tasks.map((task) => ({
+        ...task,
+        variants: task.variants.map(publicTrackVariant),
+      })),
+    }])),
+  };
+}
+
 app.get("/api/health", (_req, res) => res.json({ ok: true }));
 app.get("/api/scoring-config", (_req, res) => res.json(scoringConfig));
+app.get("/api/tracks", (_req, res) => res.json(publicTracksCatalog()));
 app.get("/api/candidates", (_req, res) => {
   const rows = db.prepare("SELECT * FROM candidates ORDER BY created_at DESC").all();
   res.json(rows.map(parseCandidate));
@@ -459,6 +617,66 @@ app.get("/api/credentials/:credentialId", (req, res) => {
   });
 });
 
+function isRecord(value) {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function validateCandidateInput(candidate) {
+  if (!isRecord(candidate)) return "candidate must be an object.";
+  const { name, email = "", consent, extra_time = false, role } = candidate;
+  if (typeof name !== "string" || !name.trim() || name.trim().length > 120 ||
+      typeof email !== "string" || email.length > 254 ||
+      (email !== "" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) ||
+      consent !== true || typeof extra_time !== "boolean" ||
+      role !== undefined && (typeof role !== "string" || role.trim().length > 120)) {
+    return "A valid candidate name, optional email, and explicit consent are required.";
+  }
+  return null;
+}
+
+app.post("/api/sessions", (req, res) => {
+  const { candidate, track, domain } = req.body ?? {};
+  const candidateError = validateCandidateInput(candidate);
+  if (candidateError) return res.status(400).json({ error: candidateError });
+  const trackDefinition = typeof track === "string" ? getTrack(track) : null;
+  if (!trackDefinition || typeof domain !== "string" || !trackDefinition.domains.includes(domain)) {
+    return res.status(400).json({ error: "Select a supported assessment track and domain." });
+  }
+  const candidateId = randomUUID();
+  const variant = variantForCandidate(candidateId, track, domain);
+  if (!variant) return res.status(400).json({ error: "No task variant is configured for this track and domain." });
+
+  const sessionId = randomUUID();
+  const now = new Date().toISOString();
+  const extraTime = candidate.extra_time ? 1 : 0;
+  const code = starterForVariant(variant);
+  const createSession = db.transaction(() => {
+    db.prepare(`INSERT INTO candidates
+      (id,name,role,email,score,verdict,status,created_at,duration_seconds,keystrokes,code,events,ai_prompts,
+       viva,flags,credential_id,session_id,task_variant,track,domain,consented_at,extra_time)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      candidateId, candidate.name.trim(), candidate.role?.trim() || "Candidate", (candidate.email || "").trim(), 0,
+      "Needs review", "In progress", now, 0, 0, code, "[]", "[]", "[]", "[]", null, sessionId,
+      variant.id, track, domain, now, extraTime,
+    );
+    db.prepare(`INSERT INTO sessions
+      (id,candidate_id,started_at,consented_at,task_variant,track,domain,extra_time)
+      VALUES (?,?,?,?,?,?,?,?)`).run(
+      sessionId, candidateId, now, now, variant.id, track, domain, extraTime,
+    );
+  });
+  createSession();
+  res.status(201).json({
+    candidate_id: candidateId,
+    session_id: sessionId,
+    consented_at: now,
+    track,
+    domain,
+    task_variant: publicTrackVariant(variant),
+    requirement_change_delay_ms: requirementChangeDelay,
+  });
+});
+
 app.post("/api/consent", (req, res) => {
   const { name, email = "", consent, extra_time = false } = req.body ?? {};
   if (typeof name !== "string" || !name.trim() || name.trim().length > 120 ||
@@ -474,21 +692,27 @@ app.post("/api/consent", (req, res) => {
   const code = `function groupBy${taskVariant.field[0].toUpperCase()}${taskVariant.field.slice(1)}(items) {\n  return items.reduce((groups, item) => {\n    const value = item.${taskVariant.field};\n    (groups[value] ??= []).push(item);\n    return groups;\n  }, {});\n}`;
   const createSession = db.transaction(() => {
     db.prepare(`INSERT INTO candidates
-      (id,name,role,email,score,verdict,status,created_at,duration_seconds,keystrokes,code,events,ai_prompts,viva,flags,credential_id,session_id,task_variant,consented_at,extra_time)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      (id,name,role,email,score,verdict,status,created_at,duration_seconds,keystrokes,code,events,ai_prompts,
+       viva,flags,credential_id,session_id,task_variant,track,domain,consented_at,extra_time)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       candidateId, name.trim(), "Software Engineer", email.trim(), 0, "Needs review", "In progress",
-      now, 0, 0, code, "[]", "[]", "[]", "[]", null, sessionId, taskVariant.id, now, extra_time ? 1 : 0,
+      now, 0, 0, code, "[]", "[]", "[]", "[]", null, sessionId, taskVariant.id, "skill", "javascript",
+      now, extra_time ? 1 : 0,
     );
     db.prepare(`INSERT INTO sessions
-      (id,candidate_id,started_at,consented_at,task_variant,extra_time)
-      VALUES (?,?,?,?,?,?)`).run(sessionId, candidateId, now, now, taskVariant.id, extra_time ? 1 : 0);
+      (id,candidate_id,started_at,consented_at,task_variant,track,domain,extra_time)
+      VALUES (?,?,?,?,?,?,?,?)`).run(
+      sessionId, candidateId, now, now, taskVariant.id, "skill", "javascript", extra_time ? 1 : 0,
+    );
   });
   createSession();
   res.status(201).json({
     candidate_id: candidateId,
     session_id: sessionId,
     consented_at: now,
-    task_variant: taskVariant,
+    track: "skill",
+    domain: "javascript",
+    task_variant: publicTrackVariant(taskVariant),
     requirement_change_delay_ms: requirementChangeDelay,
   });
 });
@@ -496,9 +720,79 @@ app.post("/api/consent", (req, res) => {
 app.get("/api/sessions/:sessionId/task", (req, res) => {
   const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Assessment session not found." });
-  const taskVariant = taskVariants.find((variant) => variant.id === session.task_variant);
+  const taskVariant = findTrackVariant(session.track, session.domain, session.task_variant);
   if (!taskVariant) return res.status(500).json({ error: "The session task variant is unavailable." });
-  res.json({ task_variant: taskVariant });
+  res.json({ task_variant: publicTrackVariant(taskVariant) });
+});
+
+app.post("/api/sessions/:sessionId/results", (req, res) => {
+  const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: "Assessment session not found." });
+  if (session.completed_at) return res.status(409).json({ error: "This assessment session is already complete." });
+
+  const body = req.body ?? {};
+  const track = body.track === undefined ? session.track : body.track;
+  const domain = body.domain === undefined ? session.domain : body.domain;
+  const trackDefinition = typeof track === "string" ? getTrack(track) : null;
+  if (!trackDefinition || typeof domain !== "string" || !trackDefinition.domains.includes(domain)) {
+    return res.status(400).json({ error: "Select a supported assessment track and domain." });
+  }
+  const variantId = body.task_variant === undefined
+    ? track === session.track && domain === session.domain
+      ? session.task_variant
+      : variantForCandidate(`${session.id}:${track}:${domain}`, track, domain)?.id
+    : body.task_variant;
+  if (typeof variantId !== "string" || !findTrackVariant(track, domain, variantId)) {
+    return res.status(400).json({ error: "The task variant is not configured for this track and domain." });
+  }
+  const evidence = body.evidence === undefined ? {} : body.evidence;
+  if (!isRecord(evidence) || JSON.stringify(evidence).length > 50000) {
+    return res.status(400).json({ error: "Evidence must be a JSON object no larger than 50000 characters." });
+  }
+
+  let result;
+  try {
+    result = scoreTrackResult({ track, domain, signals: body.signals, evidence });
+  } catch (error) {
+    return res.status(400).json({ error: error.message || "Track result signals are invalid." });
+  }
+
+  const submittedAt = new Date().toISOString();
+  const saveResult = db.transaction(() => {
+    db.prepare(`INSERT INTO track_results
+      (id,session_id,candidate_id,track,domain,task_variant,score,signals,evidence,submitted_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?)
+      ON CONFLICT(session_id,track) DO UPDATE SET
+        domain=excluded.domain,task_variant=excluded.task_variant,score=excluded.score,
+        signals=excluded.signals,evidence=excluded.evidence,submitted_at=excluded.submitted_at`)
+      .run(randomUUID(), session.id, session.candidate_id, track, domain, variantId,
+        result.score, JSON.stringify(result.signals), JSON.stringify(evidence), submittedAt);
+
+    const trackResults = readTrackResults(session.candidate_id);
+    const aggregate = scoreCandidate({ trackResults });
+    const flags = aggregate.flags;
+    db.prepare(`UPDATE candidates SET score=?,verdict=?,status='Track results saved',
+      flag_details=?,flags=?,verdict_reason=?,ai_text_note=?,scoring_components=?
+      WHERE id=?`).run(
+      aggregate.score,
+      aggregate.verdict,
+      JSON.stringify(flags),
+      JSON.stringify(flags.map((flag) => `${flag.key}: ${flag.evidence}`)),
+      aggregate.verdictReason,
+      aggregate.aiTextNote,
+      JSON.stringify(aggregate.components),
+      session.candidate_id,
+    );
+    return { aggregate, trackResults };
+  });
+  const { aggregate, trackResults } = saveResult();
+  res.status(201).json({
+    result: { ...result, task_variant: variantId, submitted_at: submittedAt },
+    authenticity_score: aggregate.score,
+    verdict: aggregate.verdict,
+    track_results: trackResults,
+    candidate: parseCandidate(db.prepare("SELECT * FROM candidates WHERE id = ?").get(session.candidate_id)),
+  });
 });
 
 app.get("/api/sessions/:sessionId/requirement-change", (req, res) => {
@@ -506,13 +800,16 @@ app.get("/api/sessions/:sessionId/requirement-change", (req, res) => {
   if (!session) return res.status(404).json({ error: "Assessment session not found." });
   const dueAt = Date.parse(session.started_at) + requirementChangeDelay;
   const fired = Boolean(session.requirement_change_at) || Date.now() >= dueAt;
+  const taskVariant = findTrackVariant(session.track, session.domain, session.task_variant);
+  const requirement = taskVariant?.requirementChange ||
+    "Also handle records with missing values for the selected field.";
   if (fired && !session.requirement_change_at) {
     const now = new Date().toISOString();
     const markRequirement = db.transaction(() => {
       db.prepare("UPDATE sessions SET requirement_change_at = ? WHERE id = ? AND requirement_change_at IS NULL").run(now, session.id);
       insertProcessEvent.run(randomUUID(), session.id, "requirement_change", now, JSON.stringify({
         detail: "A new task requirement was introduced.",
-        requirement: "Also handle records with missing values for the selected field.",
+        requirement,
       }));
     });
     markRequirement();
@@ -522,7 +819,7 @@ app.get("/api/sessions/:sessionId/requirement-change", (req, res) => {
     acknowledged: Boolean(session.requirement_change_seen),
     scheduled_at: new Date(dueAt).toISOString(),
     delay_ms: requirementChangeDelay,
-    message: fired ? "Also handle records with missing values for the selected field." : null,
+    message: fired ? requirement : null,
   });
 });
 
@@ -620,14 +917,15 @@ app.post("/api/assessment", (req, res) => {
   }));
   const insertAssessment = db.transaction(() => {
     db.prepare(`INSERT INTO candidates
-      (id,name,role,email,score,verdict,status,created_at,duration_seconds,keystrokes,code,events,ai_prompts,viva,flags,credential_id,session_id,task_variant,consented_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+      (id,name,role,email,score,verdict,status,created_at,duration_seconds,keystrokes,code,events,ai_prompts,
+       viva,flags,credential_id,session_id,task_variant,track,domain,consented_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       id, name.trim(), "Software Engineer", email.trim(), 0, "Needs review", "In progress", now,
       Number(duration_seconds), Number(keystrokes), code, JSON.stringify(events), JSON.stringify(prompts),
-      "[]", "[]", null, sessionId, taskVariant.id, now,
+      "[]", "[]", null, sessionId, taskVariant.id, "skill", "javascript", now,
     );
-    db.prepare(`INSERT INTO sessions (id,candidate_id,started_at,consented_at,task_variant)
-      VALUES (?,?,?,?,?)`).run(sessionId, id, now, now, taskVariant.id);
+    db.prepare(`INSERT INTO sessions (id,candidate_id,started_at,consented_at,task_variant,track,domain)
+      VALUES (?,?,?,?,?,?,?)`).run(sessionId, id, now, now, taskVariant.id, "skill", "javascript");
     const persistedPrompts = persistPromptRows(sessionId, prompts);
     persistEventRows(sessionId, events);
     db.prepare("UPDATE candidates SET ai_prompts=?,events=? WHERE id=?").run(JSON.stringify(persistedPrompts), JSON.stringify(events), id);
@@ -637,7 +935,19 @@ app.post("/api/assessment", (req, res) => {
 });
 
 function baseQuestions(taskVariant, requirementChangeSeen) {
-  const field = taskVariant?.field || "selected property";
+  if (!taskVariant?.field) {
+    const task = taskVariant?.title || "the task";
+    return [
+      `Walk through your approach to "${task}". Which decision mattered most?`,
+      "What would break if the inputs or workload doubled?",
+      "Which assumption or edge case did you verify first?",
+      requirementChangeSeen || taskVariant?.requirementChange
+        ? "How did the changed requirement affect your approach and verification?"
+        : "How would you adapt your work if a requirement changed?",
+      "What evidence would you gather before improving this result further?",
+    ];
+  }
+  const field = taskVariant.field;
   return [
     `Walk through your approach to grouping records by ${field}. Which decision mattered most?`,
     "What happens to time and memory use if the input doubles in size?",
@@ -689,7 +999,9 @@ app.post("/api/candidates/:id/questions", async (req, res) => {
   const row = db.prepare("SELECT * FROM candidates WHERE id = ?").get(req.params.id);
   if (!row) return res.status(404).json({ error: "Candidate not found" });
   const session = db.prepare("SELECT * FROM sessions WHERE candidate_id = ?").get(row.id);
-  const taskVariant = taskVariants.find((variant) => variant.id === session?.task_variant);
+  const taskVariant = session
+    ? findTrackVariant(session.track, session.domain, session.task_variant)
+    : null;
   const questionsFallback = baseQuestions(taskVariant, Boolean(session?.requirement_change_seen));
   try {
     const raw = await askModel([
@@ -813,9 +1125,12 @@ app.post("/api/candidates/:id/complete", (req, res) => {
   if (!row) return res.status(404).json({ error: "Candidate not found" });
   if (["Verified", "Review", "Low confidence"].includes(row.status)) return res.json(parseCandidate(row));
   const viva = JSON.parse(row.viva);
-  if (viva.length === 0 || viva.some((item) => item.score === null)) return res.status(400).json({ error: "Please answer every viva question first." });
+  const trackResults = readTrackResults(row.id);
+  if (!trackResults.length && (viva.length === 0 || viva.some((item) => item.score === null))) {
+    return res.status(400).json({ error: "Please answer every viva question first." });
+  }
   const liveCheck = row.live_check ? JSON.parse(row.live_check) : null;
-  if (!liveCheck) return res.status(400).json({ error: "Please complete the live skill check first." });
+  if (!trackResults.length && !liveCheck) return res.status(400).json({ error: "Please complete the live skill check first." });
   const events = JSON.parse(row.events);
   const ai = JSON.parse(row.ai_prompts);
   const result = scoreCandidate({
@@ -825,6 +1140,7 @@ app.post("/api/candidates/:id/complete", (req, res) => {
     liveCheck,
     durationSeconds: row.duration_seconds,
     vivaText: viva.map((item) => item.answer || "").join(" "),
+    trackResults,
   });
   const credential = result.verdict === "Verified skill" ? `sp-${randomUUID().slice(0, 12)}` : null;
   const flagDetails = result.flags;
@@ -872,17 +1188,24 @@ app.post("/api/sessions/:sessionId/assistant", async (req, res) => {
     return res.status(400).json({ error: "Enter a prompt of 1–2000 characters." });
   }
   const candidate = db.prepare("SELECT * FROM candidates WHERE id = ?").get(session.candidate_id);
-  const taskVariant = taskVariants.find((variant) => variant.id === session.task_variant);
+  const taskVariant = findTrackVariant(session.track, session.domain, session.task_variant);
   const seed = [...`${session.id}:${prompt}`].reduce((sum, character) => (sum * 31 + character.charCodeAt(0)) >>> 0, 7);
-  const seededMistake = !process.env.LLM_API_KEY && seed % 2 === 0;
+  const configuredMistakes = taskVariant?.seededAssistantMistakes || [];
+  const configuredMistakeSelected = configuredMistakes.length > 0 && seed % 2 === 0;
+  const seededMistake = configuredMistakeSelected ||
+    (!process.env.LLM_API_KEY && seed % 2 === 0 && session.track === "skill" && session.domain === "javascript");
   const mockAnswer = seededMistake
-    ? `A concise pattern is to initialize with a regular object, then use (groups[value] ??= []).push(item). That handles every string key consistently; try a special key such as __proto__ to check it.`
-    : `Start by grouping one record at a time using the task's ${taskVariant.field} field. Think through what a missing value should mean, then test an empty input and a special object key before deciding whether your accumulator is safe.`;
+    ? configuredMistakes.length
+      ? `A quick approach is to assume ${configuredMistakes[seed % configuredMistakes.length].toLowerCase()} This should be safe without another check.`
+      : `A concise pattern is to initialize with a regular object, then use (groups[value] ??= []).push(item). That handles every string key consistently; try a special key such as __proto__ to check it.`
+    : `Start by addressing the task's ${taskVariant.taskTitle || taskVariant.title || session.domain} requirements. Identify assumptions, then verify an ordinary case and a meaningful edge case before accepting a suggestion.`;
   try {
-    const answer = await askModel([
-      { role: "system", content: "You are a concise learning assistant. Give hints and explanations, not a full solution. Avoid judging the candidate." },
-      { role: "user", content: `Task: ${taskVariant.description}\nCandidate code:\n${candidate.code}\n\nQuestion: ${prompt}` },
-    ], mockAnswer);
+    const answer = configuredMistakeSelected
+      ? mockAnswer
+      : await askModel([
+        { role: "system", content: "You are a concise learning assistant. Give hints and explanations, not a full solution. Avoid judging the candidate." },
+        { role: "user", content: `Task: ${taskVariant.description}\nCandidate code:\n${candidate.code}\n\nQuestion: ${prompt}` },
+      ], mockAnswer);
     const item = {
       prompt: prompt.trim(),
       response: answer,
@@ -891,14 +1214,14 @@ app.post("/api/sessions/:sessionId/assistant", async (req, res) => {
       caught: false,
       edited_after: false,
       summary: seededMistake
-        ? "Demo assistant suggestion contains a seeded object-key mistake; review whether the candidate verified or corrected it."
+        ? "Assistant suggestion contains a seeded task-specific mistake; review whether the candidate verified or corrected it."
         : "Assistant provided a task-specific hint for the candidate to evaluate.",
     };
     const prompts = JSON.parse(candidate.ai_prompts || "[]");
     const [persistedPrompt] = persistPromptRows(session.id, [item]);
     prompts.push(persistedPrompt);
     db.prepare("UPDATE candidates SET ai_prompts=? WHERE id=?").run(JSON.stringify(prompts), candidate.id);
-    res.json({ answer, seeded_mistake: seededMistake, prompt: persistedPrompt });
+    res.json({ answer, prompt: { id: persistedPrompt.id } });
   } catch (error) {
     res.status(502).json({ error: error.message || "Assistant unavailable." });
   }
@@ -907,27 +1230,51 @@ app.post("/api/sessions/:sessionId/assistant", async (req, res) => {
 app.patch("/api/sessions/:sessionId/ai-prompts/:promptId", (req, res) => {
   const session = db.prepare("SELECT * FROM sessions WHERE id = ?").get(req.params.sessionId);
   if (!session) return res.status(404).json({ error: "Assessment session not found." });
-  const { verified } = req.body ?? {};
+  const { verified, caught, edited_after: editedAfter } = req.body ?? {};
   if (typeof verified !== "boolean") return res.status(400).json({ error: "verified must be true or false." });
-  const update = db.prepare("UPDATE ai_prompts SET verified = ? WHERE id = ? AND session_id = ?")
-    .run(verified ? 1 : 0, req.params.promptId, session.id);
+  if (caught !== undefined && typeof caught !== "boolean" || caught === true && !verified) {
+    return res.status(400).json({ error: "caught must be a boolean and can only be true when verified is true." });
+  }
+  if (editedAfter !== undefined && typeof editedAfter !== "boolean") {
+    return res.status(400).json({ error: "edited_after must be true or false." });
+  }
+  const update = db.prepare(`UPDATE ai_prompts SET verified = ?,caught = COALESCE(?,caught),
+    edited_after = COALESCE(?,edited_after) WHERE id = ? AND session_id = ?`)
+    .run(verified ? 1 : 0, caught === undefined ? null : caught ? 1 : 0,
+      editedAfter === undefined ? null : editedAfter ? 1 : 0, req.params.promptId, session.id);
   if (!update.changes) return res.status(404).json({ error: "Assistant prompt not found." });
   const candidate = db.prepare("SELECT * FROM candidates WHERE id = ?").get(session.candidate_id);
   const prompts = JSON.parse(candidate.ai_prompts || "[]");
   const prompt = db.prepare("SELECT prompt FROM ai_prompts WHERE id = ?").get(req.params.promptId);
   const item = prompts.find((entry) => entry.prompt === prompt.prompt);
-  if (item) item.verified = verified;
+  if (item) {
+    item.verified = verified;
+    if (caught !== undefined) item.caught = caught;
+    if (editedAfter !== undefined) item.edited_after = editedAfter;
+  }
   db.prepare("UPDATE candidates SET ai_prompts=? WHERE id=?").run(JSON.stringify(prompts), candidate.id);
-  res.json({ verified });
+  res.json({
+    verified,
+    ...(caught === undefined ? {} : { caught }),
+    ...(editedAfter === undefined ? {} : { edited_after: editedAfter }),
+  });
 });
 
-app.use((error, _req, res, _next) => {
+app.use((_req, res) => res.status(404).json({ error: "API route not found." }));
+app.use((error, _req, res, next) => {
+  if (res.headersSent) return next(error);
   if (error?.type === "entity.parse.failed") {
     return res.status(400).json({ error: "Request body must contain valid JSON." });
   }
-  console.error("API request failed:", error);
-  res.status(500).json({ error: "The server could not complete this request." });
+  const status = Number.isInteger(error?.status) && error.status >= 400 && error.status < 500
+    ? error.status
+    : 500;
+  if (status >= 500) console.error("API request failed:", error);
+  res.status(status).json({
+    error: status < 500 ? error.message || "The request is invalid." : "The server could not complete this request.",
+  });
 });
 
 const port = Number(process.env.PORT || 3001);
-app.listen(port, () => console.log(`SkillProof API listening on http://localhost:${port}`));
+const server = app.listen(port, () => console.log(`SkillProof API listening on http://localhost:${port}`));
+server.on("error", (error) => console.error("API listener error:", error));

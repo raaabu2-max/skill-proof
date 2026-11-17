@@ -1,4 +1,13 @@
-import type { Candidate, CredentialDetails, LiveCheck, TaskVariant, TimelineEvent, VivaAnswer } from "../types";
+import type {
+  Candidate,
+  CredentialDetails,
+  LiveCheck,
+  TaskVariant,
+  TimelineEvent,
+  TrackResult,
+  TracksCatalog,
+  VivaAnswer,
+} from "../types";
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`/api${path}`, {
@@ -13,6 +22,22 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 export const api = {
   candidates: () => request<Candidate[]>("/candidates"),
   candidate: (id: string) => request<Candidate>(`/candidates/${id}`),
+  tracks: () => request<TracksCatalog>("/tracks"),
+  startTrackSession: (name: string, email: string, extraTime: boolean, track: string, domain: string) => request<{
+    candidate_id: string;
+    session_id: string;
+    track: string;
+    domain: string;
+    task_variant: TaskVariant;
+    requirement_change_delay_ms: number;
+  }>("/sessions", {
+    method: "POST",
+    body: JSON.stringify({
+      candidate: { name, email, role: "Software Engineer", consent: true, extra_time: extraTime },
+      track,
+      domain,
+    }),
+  }),
   startSession: (name: string, email: string, extraTime: boolean) => request<{
     candidate_id: string;
     session_id: string;
@@ -32,13 +57,30 @@ export const api = {
   }),
   sessionAssistant: (sessionId: string, prompt: string) => request<{
     answer: string;
-    prompt: { id: string; seeded_mistake: boolean };
+    prompt: { id: string };
   }>(`/sessions/${sessionId}/assistant`, {
     method: "POST", body: JSON.stringify({ prompt }),
   }),
-  verifyPrompt: (sessionId: string, promptId: string, verified: boolean) => request<{ verified: boolean }>(
-    `/sessions/${sessionId}/ai-prompts/${promptId}`, { method: "PATCH", body: JSON.stringify({ verified }) },
+  verifyPrompt: (sessionId: string, promptId: string, details: {
+    verified: boolean;
+    caught?: boolean;
+    edited_after?: boolean;
+  }) => request<{ verified: boolean; caught?: boolean; edited_after?: boolean }>(
+    `/sessions/${sessionId}/ai-prompts/${promptId}`, { method: "PATCH", body: JSON.stringify(details) },
   ),
+  submitTrackResult: (sessionId: string, result: {
+    track: string;
+    domain: string;
+    task_variant: string;
+    signals: Record<string, number>;
+    evidence: Record<string, unknown>;
+  }) => request<{
+    result: TrackResult;
+    authenticity_score: number;
+    verdict: Candidate["verdict"];
+    track_results: TrackResult[];
+    candidate: Candidate;
+  }>(`/sessions/${sessionId}/results`, { method: "POST", body: JSON.stringify(result) }),
   submitAssessment: (data: {
     name: string; email: string; code: string; consent: boolean; session_id?: string; events: Candidate["events"];
     ai_prompts: Candidate["ai_prompts"]; duration_seconds: number; keystrokes: number;

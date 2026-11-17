@@ -1,5 +1,5 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ComponentProps, FormEvent, ReactNode } from "react";
+import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps, FormEvent, ReactNode, RefObject } from "react";
 import Editor from "@monaco-editor/react";
 import { AnimatePresence, animate, motion, useInView, useMotionValue, useMotionValueEvent, useReducedMotion, useScroll, useTransform } from "framer-motion";
 import Lenis from "lenis";
@@ -11,15 +11,44 @@ import trustAvatar from "./assets/team-soren-vale.svg";
 import {
   ArrowDownRight, ArrowLeft, ArrowRight, BadgeCheck, BarChart3, BrainCircuit, Check,
   CheckCircle2, ChevronRight, CircleHelp, ClipboardCheck, Clock3, Code2, Copy, ExternalLink,
-  Eye, FileCode2, Flag, KeyRound, LayoutDashboard, Lightbulb, LockKeyhole, MessageSquareText, Plus,
+  Eye, FileCode2, Flag, Home as HomeIcon, KeyRound, LayoutDashboard, Lightbulb, LockKeyhole, MessageSquareText, Plus,
   Radio, Shield, ShieldCheck, Sparkles, Upload, Users, WandSparkles, X,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "./lib/api";
-import type { Candidate, TaskVariant, TimelineEvent, VivaAnswer } from "./types";
+import type { Candidate, TaskVariant, TimelineEvent, TrackDefinition, TrackResult, TracksCatalog, VivaAnswer } from "./types";
 
 const ActivityChart = lazy(() => import("./ActivityChart"));
+
+type AssessmentTrack = "problem-solver" | "skill" | "adapt";
+type AssessmentProfile = { name: string; email: string; extraTime: boolean };
+type AssessmentJourney = {
+  tracks: AssessmentTrack[];
+  currentIndex: number;
+  profile: AssessmentProfile | null;
+  active: boolean;
+};
+type AssessmentFlow = {
+  journey: AssessmentJourney;
+  startSingle: (track: AssessmentTrack) => void;
+  startFull: () => void;
+  rememberProfile: (profile: AssessmentProfile) => void;
+  advance: () => AssessmentTrack | null;
+};
+const emptyAssessmentJourney: AssessmentJourney = {
+  tracks: [],
+  currentIndex: 0,
+  profile: null,
+  active: false,
+};
+const AssessmentFlowContext = createContext<AssessmentFlow | null>(null);
+
+function useAssessmentFlow() {
+  const flow = useContext(AssessmentFlowContext);
+  if (!flow) throw new Error("Assessment flow context is unavailable.");
+  return flow;
+}
 
 const starterCode = `function groupBy(items, key) {
   // Return an object whose values are arrays of matching items.
@@ -29,6 +58,74 @@ const starterCode = `function groupBy(items, key) {
     return groups;
   }, {});
 }`;
+
+const defaultTrackDomain: Record<AssessmentTrack, string> = {
+  "problem-solver": "javascript",
+  skill: "javascript",
+  adapt: "javascript",
+};
+
+function starterForTask(variant: TaskVariant | null, domain: string) {
+  if (variant?.starter) return variant.starter;
+  if (variant?.field) {
+    const functionName = `groupBy${variant.field[0].toUpperCase()}${variant.field.slice(1)}`;
+    return `function ${functionName}(items) {\n  return items.reduce((groups, item) => {\n    const value = item.${variant.field};\n    (groups[value] ??= []).push(item);\n    return groups;\n  }, {});\n}`;
+  }
+  return domain === "javascript" ? starterCode : "";
+}
+
+function checksForWork(track: AssessmentTrack, domain: string, value: string, variant: TaskVariant | null, requirementSeen: boolean) {
+  const text = value.toLowerCase();
+  if (track === "problem-solver") {
+    const tests = variant?.failingTests || ["Task-specific behavior", "Edge-case handling"];
+    return tests.map((test) => {
+      const label = test.toLowerCase();
+      if (label.includes("round") || label.includes("currency")) return /math\.round|tofixed\s*\(\s*2\s*\)/i.test(value);
+      if (label.includes("tax")) return /subtotal\s*\+\s*subtotal\s*\*\s*taxrate|subtotal\s*\*\s*\(\s*1\s*\+\s*taxrate|subtotal\s*\*\s*taxrate|taxrate\s*\*\s*subtotal/i.test(value);
+      if (label.includes("empty") || label.includes("zero summary")) return /items\.length|if\s*\(\s*!items|items\?\.\s*length/i.test(value);
+      if (label.includes("discount")) return /math\.(min|max)|discount\s*>\s*subtotal/i.test(value);
+      if (label.includes("quantity")) return /quantity\s*[<]=?\s*0|number\.isfinite|throw new/i.test(value);
+      if (label.includes("duplicated") || label.includes("fan-out")) return /distinct|group by|select\s+.+sum|subquery/i.test(value);
+      if (label.includes("month")) return /calendar|cross join|coalesce|generate_series/i.test(value);
+      return value.trim().length > 20;
+    });
+  }
+  if (track === "adapt") {
+    const isPractical = domain === "marketing" || domain === "accounting";
+    return [
+      value.trim().length > 20,
+      isPractical ? /\b(plan|reconcile|budget|transaction|audience|evidence)\b/i.test(value) : /\b(function|return|select|def)\b/i.test(value),
+      !requirementSeen || (domain === "javascript" ? /unknown|missing|null|fallback/i.test(text) : /budget|30%|late|source|evidence|updated/i.test(text)),
+    ];
+  }
+  return [
+    value.trim().length > 20,
+    domain === "javascript" ? /function|=>|return/.test(value) : domain === "python" ? /def |return /.test(value) : domain === "sql" ? /select |from |group by/i.test(value) : value.trim().split(/\n/).filter((line) => line.trim().length > 0).length >= 3,
+    /\b(test|edge|verify|check|missing|empty|distinct|measure|evidence)\b/i.test(value),
+  ];
+}
+
+function trackSignals(candidate: Candidate, liveCheck: number, explanation = "") {
+  const scoredAnswers = candidate.viva.map((answer) => answer.score).filter((score): score is number => score !== null);
+  const viva = scoredAnswers.length
+    ? Math.round(scoredAnswers.reduce((sum, score) => sum + score, 0) / scoredAnswers.length)
+    : Math.min(100, explanation.trim().length ? 45 + Math.floor(explanation.trim().length / 4) : 0);
+  const editCount = candidate.events.reduce((sum, event) => sum + (event.type === "edit" ? event.count : 0), 0);
+  const testRuns = candidate.events.filter((event) => event.type === "run").length;
+  const process = Math.min(100, 35 + editCount * 3 + testRuns * 8);
+  const prompts = candidate.ai_prompts;
+  const aiUsage = prompts.length
+    ? Math.round(65 + prompts.filter((item) => item.verified).length / prompts.length * 20 +
+      prompts.filter((item) => item.seeded_mistake && (item.caught || item.edited_after)).length / prompts.length * 15)
+    : 75;
+  return {
+    viva,
+    process,
+    aiUsage,
+    liveCheck,
+    timeAndPaste: 75,
+  };
+}
 
 function Logo({ small = false }: { small?: boolean }) {
   return <Link to="/" className="brand-link flex items-center gap-2.5 font-semibold tracking-tight">
@@ -48,36 +145,23 @@ function TopNav({ dashboard = false }: { dashboard?: boolean }) {
   return <header className={`top-nav sticky top-0 z-30 border-b backdrop-blur-xl${scrolled ? " top-nav-scrolled" : ""}`}>
     <div className={`top-nav-inner mx-auto flex ${scrolled ? "h-[62px]" : "h-[68px]"} max-w-[1240px] items-center justify-between px-5 lg:px-8`}>
       <Logo />
-      {dashboard ? <nav aria-label="Hiring workspace" className="hidden items-center gap-1 md:flex">
-        <Link to="/dashboard" title="Dashboard" aria-label="Dashboard" className="nav-active flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium"><LayoutDashboard size={16} /> Dashboard</Link>
-        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm transition"><BadgeCheck size={16} /> Verify</Link>
-        <Link to="/" title="Candidate experience" aria-label="Candidate experience" className="flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm transition"><Users size={16} /> Candidate</Link>
-      </nav> : <nav aria-label="Main navigation" className="hidden items-center gap-5 text-[13px] md:flex">
-        <a href="#features" title="Features" aria-label="Features" className="flex items-center gap-2 transition"><Sparkles size={15} /> Features</a>
-        <a href="#how-it-works" title="How it works" aria-label="How it works" className="flex items-center gap-2 transition"><ClipboardCheck size={15} /> How it works</a>
-        <a href="#principles" title="Our principles" aria-label="Our principles" className="flex items-center gap-2 transition"><ShieldCheck size={15} /> Principles</a>
-        <Link to="/dashboard" title="For hiring teams" aria-label="For hiring teams" className="flex items-center gap-2 transition"><LayoutDashboard size={15} /> Hiring teams</Link>
-        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex items-center gap-2 transition"><BadgeCheck size={15} /> Verify</Link>
-      </nav>}
+      <nav aria-label="Main navigation" className="hidden items-center gap-5 text-[13px] md:flex">
+        <Link to="/" title="Home" aria-label="Home" className="flex items-center gap-2 transition"><HomeIcon size={15} /> Home</Link>
+        <Link to="/assessments" title="Assessments" aria-label="Assessments" className="flex items-center gap-2 transition"><ClipboardCheck size={15} /> Assessments</Link>
+        <Link to="/hr" title="HR Dashboard" aria-label="HR Dashboard" aria-current={dashboard ? "page" : undefined} className="flex items-center gap-2 transition"><LayoutDashboard size={15} /> HR Dashboard</Link>
+        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex items-center gap-2 transition"><BadgeCheck size={15} /> Verify credential</Link>
+      </nav>
       <div className="flex items-center gap-3">
-        <Link to="/dashboard" title="Sign in" aria-label="Sign in" className="nav-signin hidden items-center gap-1.5 text-[13px] font-medium md:inline-flex"><Users size={15} /> Sign in</Link>
-        <Link to="/assessment" title="Try the demo" aria-label="Try the demo" className="nav-cta primary-glow inline-flex items-center gap-2 rounded-full px-3.5 py-2.5 text-[13px] font-semibold text-white transition md:px-4">
+        <Link to="/assessments" title="Try the demo" aria-label="Try the demo" className="nav-cta primary-glow inline-flex items-center gap-2 rounded-full px-3.5 py-2.5 text-[13px] font-semibold text-white transition md:px-4">
           <Code2 size={15} /><span className="hidden md:inline">Try the demo</span><ArrowRight className="hidden md:block" size={14} />
         </Link>
       </div>
     </div>
     <nav aria-label="Mobile navigation" className="mobile-nav mx-auto flex max-w-[1240px] gap-5 overflow-x-auto px-5 pb-3 text-xs md:hidden lg:px-8">
-      {dashboard ? <>
-        <Link to="/dashboard" title="Dashboard" aria-label="Dashboard" className="flex shrink-0 items-center gap-2 font-medium"><LayoutDashboard size={16} /><span className="hidden md:inline">Dashboard</span></Link>
-        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex shrink-0 items-center gap-2"><BadgeCheck size={16} /><span className="hidden md:inline">Verify</span></Link>
-        <Link to="/" title="Candidate experience" aria-label="Candidate experience" className="flex shrink-0 items-center gap-2"><Users size={16} /><span className="hidden md:inline">Candidate</span></Link>
-      </> : <>
-        <a href="#features" title="Features" aria-label="Features" className="flex shrink-0 items-center gap-2"><Sparkles size={16} /><span className="hidden md:inline">Features</span></a>
-        <a href="#how-it-works" title="How it works" aria-label="How it works" className="flex shrink-0 items-center gap-2"><ClipboardCheck size={16} /><span className="hidden md:inline">How it works</span></a>
-        <a href="#principles" title="Our principles" aria-label="Our principles" className="flex shrink-0 items-center gap-2"><ShieldCheck size={16} /><span className="hidden md:inline">Principles</span></a>
-        <Link to="/dashboard" title="For hiring teams" aria-label="For hiring teams" className="flex shrink-0 items-center gap-2"><LayoutDashboard size={16} /><span className="hidden md:inline">Hiring teams</span></Link>
-        <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex shrink-0 items-center gap-2"><BadgeCheck size={16} /><span className="hidden md:inline">Verify</span></Link>
-      </>}
+      <Link to="/" title="Home" aria-label="Home" className="flex shrink-0 items-center gap-2"><HomeIcon size={16} />Home</Link>
+      <Link to="/assessments" title="Assessments" aria-label="Assessments" className="flex shrink-0 items-center gap-2"><ClipboardCheck size={16} />Assessments</Link>
+      <Link to="/hr" title="HR Dashboard" aria-label="HR Dashboard" className="flex shrink-0 items-center gap-2"><LayoutDashboard size={16} />HR Dashboard</Link>
+      <Link to="/verify" title="Verify credential" aria-label="Verify credential" className="flex shrink-0 items-center gap-2"><BadgeCheck size={16} />Verify credential</Link>
     </nav>
   </header>;
 }
@@ -321,7 +405,7 @@ function FeatureCard({ item, index }: { item: { icon: LucideIcon; title: string;
   </motion.div>;
 }
 
-function BeforeAfterSection() {
+function BeforeAfterSection({ sectionRef }: { sectionRef: RefObject<HTMLElement | null> }) {
   const ref = useRef<HTMLDivElement | null>(null);
   const isInView = useInView(ref, { once: true, amount: 0.25 });
   const reduceMotion = useReducedMotion() === true;
@@ -336,7 +420,7 @@ function BeforeAfterSection() {
     "Human reviewers consider multiple signals",
   ];
 
-  return <section className="comparison-section" aria-labelledby="comparison-heading">
+  return <section ref={sectionRef} id="solution" className="comparison-section" aria-labelledby="comparison-heading">
     <ScrollReveal className="comparison-heading">
       <span className="section-kicker">A CLEARER WAY TO SEE SKILL</span>
       <h2 id="comparison-heading">Beyond a single answer.</h2>
@@ -396,21 +480,198 @@ function FinalCta() {
         <h2>Make room for real skill.</h2>
         <p>Explore a practical, human-first way to understand how candidates work.</p>
       </div>
-      <Link to="/assessment" className="final-cta-link">Try the live demo <ArrowRight size={16} /></Link>
+      <Link to="/assessments" className="final-cta-link">Try the live demo <ArrowRight size={16} /></Link>
     </motion.div>
   </section>;
 }
 
+type OutlineSection = { label: string; id: string; sectionRef: RefObject<HTMLElement | null> };
+
+function OutlineWheelItem({ section, index, activeIndex, onActiveChange, reduceMotion }: {
+  section: OutlineSection;
+  index: number;
+  activeIndex: number;
+  onActiveChange: (index: number) => void;
+  reduceMotion: boolean;
+}) {
+  const { scrollYProgress } = useScroll({
+    target: section.sectionRef,
+    offset: ["start 82%", "end 18%"],
+  });
+  const previousProgress = useRef(scrollYProgress.get());
+  const opacity = useTransform(scrollYProgress, [0, 0.2, 0.5, 0.8, 1], [0.32, 0.5, 1, 0.5, 0.32]);
+  const color = useTransform(scrollYProgress, [0, 0.2, 0.5, 0.8, 1], ["#77777e", "#a1a1a6", "#ffffff", "#a1a1a6", "#77777e"]);
+  const isActive = activeIndex === index;
+  const distance = index - activeIndex;
+
+  useMotionValueEvent(scrollYProgress, "change", (latest) => {
+    const previous = previousProgress.current;
+    if ((previous < 0.5 && latest >= 0.5) || (previous > 0.5 && latest <= 0.5)) {
+      onActiveChange(index);
+    }
+    previousProgress.current = latest;
+  });
+
+  useEffect(() => {
+    const current = scrollYProgress.get();
+    if (current >= 0.4 && current <= 0.6) onActiveChange(index);
+  }, [index, onActiveChange, scrollYProgress]);
+
+  return <motion.li
+    className={`outline-wheel-item${isActive ? " is-active" : ""}`}
+    animate={{
+      x: reduceMotion ? 0 : Math.sin(distance * 0.48) * 18,
+      scale: reduceMotion || isActive ? 1 : 0.96,
+    }}
+    style={{
+      opacity: reduceMotion ? (isActive ? 1 : 0.46) : (isActive ? 1 : opacity),
+      color: reduceMotion || isActive ? (isActive ? "#ffffff" : "#85858b") : color,
+    }}
+    transition={{ duration: reduceMotion ? 0.16 : 0.34, ease: "easeOut" }}
+  >
+    <a className="outline-wheel-link" href={`#${section.id}`} aria-current={isActive ? "location" : undefined} onClick={() => onActiveChange(index)}>
+      <motion.span className="outline-wheel-arrow" aria-hidden="true" animate={{ opacity: isActive ? 1 : 0 }} transition={{ duration: reduceMotion ? 0.12 : 0.22 }}>
+        <ArrowRight size={12} />
+      </motion.span>
+      <span>{section.label}</span>
+    </a>
+  </motion.li>;
+}
+
+function OutlineWheel({ sections, activeIndex, onActiveChange }: {
+  sections: OutlineSection[];
+  activeIndex: number;
+  onActiveChange: (index: number) => void;
+}) {
+  const reduceMotion = useReducedMotion() === true;
+
+  return <nav className="outline-wheel" aria-label="Page outline">
+    <ul className="outline-wheel-list">
+      {sections.map((section, index) => <OutlineWheelItem
+        key={section.id}
+        section={section}
+        index={index}
+        activeIndex={activeIndex}
+        onActiveChange={onActiveChange}
+        reduceMotion={reduceMotion}
+      />)}
+    </ul>
+  </nav>;
+}
+
+type HeroPreviewMode = "assessment" | "process" | "viva" | "credential";
+
+function HeroProductPreview({ mode }: { mode: HeroPreviewMode }) {
+  const modeLabels: Record<HeroPreviewMode, string> = {
+    assessment: "ASSESSMENT · TASK 01",
+    process: "PROCESS REPLAY · SESSION 01",
+    viva: "VIVA · FOLLOW-UP",
+    credential: "VERIFIED CREDENTIAL",
+  };
+  const sidebar = [
+    { icon: Code2, label: "Assessment", active: mode === "assessment" },
+    { icon: Radio, label: "Process replay", active: mode === "process" },
+    { icon: MessageSquareText, label: "Viva", active: mode === "viva" },
+    { icon: BadgeCheck, label: "Credential", active: mode === "credential" },
+  ];
+
+  return <div className="product-window hero-preview-window">
+    <div className="window-topbar">
+      <div className="window-dots"><i /><i /><i /></div>
+      <span>SKILLPROOF / CANDIDATE WORKSPACE</span>
+      <span className="window-secure"><ShieldCheck size={12} /> PRIVATE</span>
+    </div>
+    <div className="product-content">
+      <div className="product-sidebar">
+        <span className="sidebar-mark"><ShieldCheck size={17} /></span>
+        {sidebar.map(({ icon: Icon, label, active }) => <span key={label} className={active ? "sidebar-active" : ""} aria-label={label}><Icon size={15} /></span>)}
+      </div>
+      <div className="product-main">
+        {mode === "assessment" && <>
+          <div className="product-heading"><div><span className="product-kicker">{modeLabels[mode]}</span><h3>Group items by key</h3></div><span className="task-status"><i /> IN PROGRESS</span></div>
+          <div className="code-preview">
+            <div className="code-tabs"><span>solution.js</span><span>⌘</span></div>
+            <pre><span className="code-muted">01</span> <span className="code-purple">function</span> groupBy(items, key) {"{"}{"\n"}<span className="code-muted">02</span>   <span className="code-purple">return</span> items.<span className="code-yellow">reduce</span>((groups, item) =&gt; {"{"}{"\n"}<span className="code-muted">03</span>     <span className="code-purple">const</span> value = item[key];{"\n"}<span className="code-muted">04</span>     (groups[value] ??= []).<span className="code-yellow">push</span>(item);{"\n"}<span className="code-muted">05</span>     <span className="code-purple">return</span> groups;{"\n"}<span className="code-muted">06</span>   {"}"}, {"{}"});{"\n"}<span className="code-muted">07</span> {"}"}</pre>
+          </div>
+          <div className="product-foot"><span><Eye size={13} /> Candidate-consented process</span><span>00:18:42</span></div>
+        </>}
+        {mode === "process" && <>
+          <div className="product-heading"><div><span className="product-kicker">{modeLabels[mode]}</span><h3>How the solution came together</h3></div><span className="task-status"><i /> REVIEW READY</span></div>
+          <div className="preview-timeline">
+            <div className="preview-timeline-row"><time>09:14</time><i /><div><strong>Outlined an approach</strong><small>Started with a clear grouping strategy</small></div></div>
+            <div className="preview-timeline-row"><time>09:21</time><i /><div><strong>Refined the logic</strong><small>Adjusted the solution for edge cases</small></div></div>
+            <div className="preview-timeline-row"><time>09:32</time><i /><div><strong>Validated the result</strong><small>Checked empty and repeated values</small></div></div>
+          </div>
+          <div className="product-foot"><span><Eye size={13} /> Evidence in context</span><span>18 min</span></div>
+        </>}
+        {mode === "viva" && <>
+          <div className="product-heading"><div><span className="product-kicker">{modeLabels[mode]}</span><h3>Explain the trade-off</h3></div><span className="task-status"><i /> COMPLETE</span></div>
+          <div className="preview-viva">
+            <div className="preview-viva-message"><span>REVIEWER</span><p>What would you change if the input grew significantly?</p></div>
+            <div className="preview-viva-message is-candidate"><span>CANDIDATE</span><p>I’d consider streaming the items, while keeping each group’s order intact.</p></div>
+          </div>
+          <div className="product-foot"><span><MessageSquareText size={13} /> Reasoning, in their own words</span><span>02:16</span></div>
+        </>}
+        {mode === "credential" && <>
+          <div className="product-heading"><div><span className="product-kicker">{modeLabels[mode]}</span><h3>Assessment complete</h3></div><span className="task-status"><i /> VERIFIED</span></div>
+          <div className="preview-credential">
+            <span className="preview-credential-icon"><ShieldCheck size={27} /></span>
+            <div><strong>SkillProof credential</strong><small>Practical skill · Process · Viva</small></div>
+            <span className="preview-credential-check"><CheckCircle2 size={17} /></span>
+          </div>
+          <div className="product-foot"><span><BadgeCheck size={13} /> Shareable evidence record</span><span>SP-2048</span></div>
+        </>}
+      </div>
+    </div>
+    <div className="product-bottom"><span>ASSESSMENT SIGNALS</span><div><i className="signal-green" /><i className="signal-pink" /><i className="signal-yellow" /><i className="signal-blue" /></div><strong>{mode === "credential" ? "Credential verified" : "4 signals in context"}</strong></div>
+  </div>;
+}
+
 function Home() {
   const heroRef = useRef<HTMLElement | null>(null);
+  const problemRef = heroRef;
+  const howRef = useRef<HTMLElement | null>(null);
+  const featuresRef = useRef<HTMLElement | null>(null);
+  const solutionRef = useRef<HTMLElement | null>(null);
+  const teamRef = useRef<HTMLElement | null>(null);
+  const [activeOutlineIndex, setActiveOutlineIndex] = useState(0);
+  const [previewMode, setPreviewMode] = useState<HeroPreviewMode>("assessment");
   const { scrollYProgress: heroProgress } = useScroll({ target: heroRef, offset: ["start start", "end start"] });
+  const { scrollYProgress: processPreviewProgress } = useScroll({ target: howRef, offset: ["start 82%", "end 18%"] });
+  const { scrollYProgress: vivaPreviewProgress } = useScroll({ target: featuresRef, offset: ["start 82%", "end 18%"] });
+  const { scrollYProgress: credentialPreviewProgress } = useScroll({ target: solutionRef, offset: ["start 82%", "end 18%"] });
+  const previousProcessProgress = useRef(processPreviewProgress.get());
+  const previousVivaProgress = useRef(vivaPreviewProgress.get());
+  const previousCredentialProgress = useRef(credentialPreviewProgress.get());
   const headlineOpacity = useTransform(heroProgress, [0, 0.72], [1, 0]);
   const headlineScale = useTransform(heroProgress, [0, 0.72], [1, 0.95]);
   const mockupY = useTransform(heroProgress, [0, 1], [0, -76]);
   const visualY = useTransform(heroProgress, [0, 1], [0, -36]);
   const processNoteY = useTransform(heroProgress, [0, 1], [0, -112]);
   const scoreNoteY = useTransform(heroProgress, [0, 1], [0, -22]);
+  const pointerX = useMotionValue(0);
+  const pointerY = useMotionValue(0);
+  const rotateX = useTransform(pointerY, [-1, 1], [7, -7]);
+  const rotateY = useTransform(pointerX, [-1, 1], [-9, 9]);
   const reduceMotion = useReducedMotion() === true;
+  useMotionValueEvent(processPreviewProgress, "change", (progress) => {
+    const previous = previousProcessProgress.current;
+    if (previous < 0.5 && progress >= 0.5) setPreviewMode("process");
+    if (previous >= 0.5 && progress < 0.5) setPreviewMode("assessment");
+    previousProcessProgress.current = progress;
+  });
+  useMotionValueEvent(vivaPreviewProgress, "change", (progress) => {
+    const previous = previousVivaProgress.current;
+    if (previous < 0.5 && progress >= 0.5) setPreviewMode("viva");
+    if (previous >= 0.5 && progress < 0.5) setPreviewMode("process");
+    previousVivaProgress.current = progress;
+  });
+  useMotionValueEvent(credentialPreviewProgress, "change", (progress) => {
+    const previous = previousCredentialProgress.current;
+    if (previous < 0.5 && progress >= 0.5) setPreviewMode("credential");
+    if (previous >= 0.5 && progress < 0.5) setPreviewMode("viva");
+    previousCredentialProgress.current = progress;
+  });
   const steps: HowStep[] = [
     { number: "01", icon: ClipboardCheck, title: "A real task", text: "Candidates work on the same practical challenge in a focused workspace.", color: "mint" },
     { number: "02", icon: Radio, title: "Process, not just output", text: "With consent, see how an idea takes shape through edits and decisions.", color: "pink" },
@@ -431,17 +692,31 @@ function Home() {
     { name: "Elowen Pike", role: "Head of Product", bio: "Shapes focused workflows that help candidates show their thinking.", avatar: productAvatar },
     { name: "Soren Vale", role: "Head of Trust & Safety", bio: "Keeps fairness, consent, and transparency central to every review.", avatar: trustAvatar },
   ];
+  const outlineSections: OutlineSection[] = [
+    { label: "Problem", id: "problem", sectionRef: problemRef },
+    { label: "How it works", id: "how-it-works", sectionRef: howRef },
+    { label: "Features", id: "features", sectionRef: featuresRef },
+    { label: "Solution", id: "solution", sectionRef: solutionRef },
+    { label: "Team", id: "team", sectionRef: teamRef },
+  ];
   return <div className="landing-page min-h-screen">
+    <motion.div className="hero-intro-curtain" initial={{ opacity: 1 }} animate={{ opacity: 0 }} transition={{ duration: reduceMotion ? 0.2 : 0.72, ease: "easeOut" }} aria-hidden="true" />
     <TopNav />
+    <OutlineWheel sections={outlineSections} activeIndex={activeOutlineIndex} onActiveChange={setActiveOutlineIndex} />
     <main>
-      <section ref={heroRef} className="landing-hero">
+      <section ref={heroRef} id="problem" className="landing-hero">
         <ScrollReveal className="landing-hero-inner">
           <motion.div className="hero-copy" style={reduceMotion ? { opacity: headlineOpacity } : { opacity: headlineOpacity, scale: headlineScale }}>
             <div className="hero-eyebrow"><span /> THE HUMAN SIDE OF TECH HIRING</div>
-            <h1>See the thinking.<br />Meet the <span>real talent.</span></h1>
+            <motion.h1
+              className="hero-intro-title"
+              initial={{ opacity: 0, y: reduceMotion ? 0 : 24 }}
+              animate={{ opacity: 1, y: 0 }}
+              transition={{ duration: reduceMotion ? 0.2 : 0.65, delay: reduceMotion ? 0 : 0.96, ease: "easeOut" }}
+            >See the thinking.<br />Meet the <span>real talent.</span></motion.h1>
             <p>Great hiring is more than a perfect answer. SkillProof brings the process, reasoning, and practical skill into one clear picture — with AI treated as a tool, not a verdict.</p>
             <div className="hero-actions">
-              <Link to="/assessment" className="hero-primary primary-glow">Try the live demo <ArrowRight size={16} /></Link>
+              <Link to="/assessments" className="hero-primary primary-glow">Try the live demo <ArrowRight size={16} /></Link>
               <a href="#how-it-works" className="hero-secondary">Explore the platform <ArrowDownRight size={16} /></a>
             </div>
             <div className="hero-trust">
@@ -454,21 +729,35 @@ function Home() {
             <div className="visual-orbit orbit-teal" />
             <motion.div className="floating-note note-process" style={reduceMotion ? undefined : { y: processNoteY }}><span className="live-dot" /><div><strong>Process replay</strong><small>Thoughtful edits · 18 min</small></div><Radio size={17} /></motion.div>
             <motion.div className="product-window-parallax" style={reduceMotion ? undefined : { y: mockupY }}>
-            <div className="product-window">
-              <div className="window-topbar"><div className="window-dots"><i /><i /><i /></div><span>SKILLPROOF / CANDIDATE WORKSPACE</span><span className="window-secure"><ShieldCheck size={12} /> PRIVATE</span></div>
-              <div className="product-content">
-                <div className="product-sidebar"><span className="sidebar-mark"><ShieldCheck size={17} /></span><span className="sidebar-active"><Code2 size={15} /></span><span><Radio size={15} /></span><span><MessageSquareText size={15} /></span><span><BadgeCheck size={15} /></span></div>
-                <div className="product-main">
-                  <div className="product-heading"><div><span className="product-kicker">ASSESSMENT · TASK 01</span><h3>Group items by key</h3></div><span className="task-status"><i /> IN PROGRESS</span></div>
-                  <div className="code-preview">
-                    <div className="code-tabs"><span>solution.js</span><span>⌘</span></div>
-                    <pre><span className="code-muted">01</span> <span className="code-purple">function</span> groupBy(items, key) {"{"}{"\n"}<span className="code-muted">02</span>   <span className="code-purple">return</span> items.<span className="code-yellow">reduce</span>((groups, item) =&gt; {"{"}{"\n"}<span className="code-muted">03</span>     <span className="code-purple">const</span> value = item[key];{"\n"}<span className="code-muted">04</span>     (groups[value] ??= []).<span className="code-yellow">push</span>(item);{"\n"}<span className="code-muted">05</span>     <span className="code-purple">return</span> groups;{"\n"}<span className="code-muted">06</span>   {"}"}, {"{}"});{"\n"}<span className="code-muted">07</span> {"}"}</pre>
-                  </div>
-                  <div className="product-foot"><span><Eye size={13} /> Candidate-consented process</span><span>00:18:42</span></div>
-                </div>
-              </div>
-              <div className="product-bottom"><span>ASSESSMENT SIGNALS</span><div><i className="signal-green" /><i className="signal-pink" /><i className="signal-yellow" /><i className="signal-blue" /></div><strong>4 signals in context</strong></div>
-            </div>
+              <motion.div
+                className="hero-preview-card"
+                style={reduceMotion ? undefined : { rotateX, rotateY, transformPerspective: 1100 }}
+                onMouseMove={reduceMotion ? undefined : (event) => {
+                  const bounds = event.currentTarget.getBoundingClientRect();
+                  pointerX.set((event.clientX - bounds.left) / bounds.width * 2 - 1);
+                  pointerY.set((event.clientY - bounds.top) / bounds.height * 2 - 1);
+                }}
+                onMouseLeave={() => {
+                  pointerX.set(0);
+                  pointerY.set(0);
+                }}
+              >
+                <svg className="hero-frame-brackets" viewBox="0 0 1000 600" preserveAspectRatio="none" aria-hidden="true">
+                  {["M82 18H20V80", "M918 18H980V80", "M20 520V582H82", "M980 520V582H918"].map((path) => <motion.path key={path} d={path} initial={reduceMotion ? false : { pathLength: 0 }} animate={{ pathLength: 1 }} transition={{ duration: reduceMotion ? 0 : 0.68, delay: reduceMotion ? 0 : 0.22, ease: "easeInOut" }} />)}
+                </svg>
+                <AnimatePresence mode="wait" initial={false}>
+                  <motion.div
+                    key={previewMode}
+                    className="hero-preview-swap"
+                    initial={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 8, filter: "blur(3px)" }}
+                    animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+                    exit={{ opacity: 0, y: reduceMotion ? 0 : -5, filter: "blur(2px)" }}
+                    transition={{ duration: reduceMotion ? 0.16 : 0.38, ease: "easeOut" }}
+                  >
+                    <HeroProductPreview mode={previewMode} />
+                  </motion.div>
+                </AnimatePresence>
+              </motion.div>
             </motion.div>
             <motion.div className="floating-note note-score" style={reduceMotion ? undefined : { y: scoreNoteY }}><span className="score-orb"><Sparkles size={16} /></span><div><small>Understanding score</small><strong>92 <em>/ 100</em></strong></div><span className="score-trend">+12%</span></motion.div>
             <div className="visual-caption"><span>01</span> A clearer view of real skill <i /></div>
@@ -486,7 +775,7 @@ function Home() {
         </ScrollReveal>
       </section>
 
-      <section id="how-it-works" className="how-section">
+      <section ref={howRef} id="how-it-works" className="how-section">
         <ScrollReveal className="section-heading">
           <div><span className="section-kicker">FROM FIRST LINE TO FULL PICTURE</span><h2>A better way to<br /><span>see what people can do.</span></h2></div>
           <p>One polished answer can’t tell the whole story. We bring together practical work, real reasoning, and human review.</p>
@@ -494,13 +783,13 @@ function Home() {
         <StepsTimeline steps={steps} />
       </section>
 
-      <section id="features" className="evidence-section">
+      <section ref={featuresRef} id="features" className="evidence-section">
         <ScrollReveal className="evidence-heading"><span className="section-kicker">THE WHOLE STORY, NOT JUST THE SUBMISSION</span><h2>Six signals.<br /><span>One human decision.</span></h2><p>Each signal adds context. None is treated as proof of authorship or a standalone hiring decision.</p></ScrollReveal>
         <ScrollReveal className="evidence-grid">{evidence.map((item, index) => <FeatureCard key={item.title} item={item} index={index} />)}</ScrollReveal>
         <ScrollReveal className="fairness-note"><span className="fairness-icon"><ShieldCheck size={18} /></span><p><strong>AI use is context, not a verdict.</strong> We never reject candidates based on AI activity alone. Review the evidence, then make a fair, informed decision.</p><Link to="/dashboard">How we keep it fair <ArrowRight size={14} /></Link></ScrollReveal>
       </section>
 
-      <BeforeAfterSection />
+      <BeforeAfterSection sectionRef={solutionRef} />
 
       <section id="principles" className="principles-section">
         <ScrollReveal className="principles-copy"><span className="section-kicker">DESIGNED AROUND PEOPLE</span><h2>Make room for<br /><span>the human part.</span></h2><p>Candidates deserve a chance to show how they think. Hiring teams deserve evidence they can actually discuss.</p><Link to="/dashboard" className="principles-link">Explore the hiring workspace <ArrowRight size={15} /></Link></ScrollReveal>
@@ -512,7 +801,7 @@ function Home() {
           <div className="principles-card-foot"><span><i /> TRUST BY DESIGN</span><span>SKILLPROOF · 2026</span></div>
         </ScrollReveal>
       </section>
-      <section className="team-section" aria-labelledby="team-heading">
+      <section ref={teamRef} id="team" className="team-section" aria-labelledby="team-heading">
         <ScrollReveal className="team-heading">
           <span className="section-kicker">THE PEOPLE BEHIND THE PLATFORM</span>
           <h2 id="team-heading">Meet the team</h2>
@@ -537,15 +826,81 @@ function Home() {
 }
 
 function PageFrame({ children, dashboard = false }: { children: ReactNode; dashboard?: boolean }) {
-  return <div className="min-h-screen"><TopNav dashboard={dashboard} />{children}</div>;
+  return <div className="app-shell min-h-screen"><TopNav dashboard={dashboard} />{children}</div>;
 }
 
-function Pill({ children, tone = "green" }: { children: React.ReactNode; tone?: "green" | "amber" | "red" | "gray" }) {
+function AssessmentHub() {
+  const tracks: {
+    slug: AssessmentTrack | "full";
+    title: string;
+    description: string;
+    time: string;
+    difficulty: string;
+    icon: LucideIcon;
+  }[] = [
+    {
+      slug: "problem-solver",
+      title: "Problem Solver",
+      description: "Debug a messy mini-project, explain hidden bugs, and work through failing checks.",
+      time: "15–20 min",
+      difficulty: "Intermediate",
+      icon: FileCode2,
+    },
+    {
+      slug: "skill",
+      title: "Skill",
+      description: "Build a practical task in your chosen domain, then defend your approach in an AI viva.",
+      time: "20–25 min",
+      difficulty: "Intermediate",
+      icon: Code2,
+    },
+    {
+      slug: "adapt",
+      title: "Adapt",
+      description: "Handle a changing requirement, verify AI suggestions, and improve your result.",
+      time: "15–20 min",
+      difficulty: "Advanced",
+      icon: WandSparkles,
+    },
+    {
+      slug: "full",
+      title: "Full assessment",
+      description: "Complete Problem Solver, Skill, and Adapt in sequence.",
+      time: "50–65 min",
+      difficulty: "Mixed",
+      icon: ClipboardCheck,
+    },
+  ];
+
+  return <PageFrame><main className="mx-auto max-w-[1120px] px-5 py-10 sm:py-14">
+    <div className="max-w-[680px]">
+      <p className="text-[10px] font-semibold uppercase tracking-[.16em] text-[#7b927f]">Choose your assessment</p>
+      <h1 className="app-page-title mt-3 text-[32px] font-semibold tracking-[-.05em] sm:text-[40px]">Show how you work.</h1>
+      <p className="mt-2 text-[13px] leading-6 text-[#748078]">Pick a focused track or complete the full assessment. Recording starts only after you review and accept the consent screen.</p>
+    </div>
+    <div className="mt-8 grid gap-4 md:grid-cols-2">
+      {tracks.map(({ slug, title, description, time, difficulty, icon: Icon }) => <article key={slug} className="flex min-h-[260px] flex-col rounded-[22px] border border-[#e5ebe6] bg-white p-6 shadow-[0_12px_42px_#17321b08] sm:p-7">
+        <div className="grid size-12 place-items-center rounded-2xl bg-[#edf5ef] text-[#4c805b]"><Icon size={22} /></div>
+        <h2 className="mt-5 text-[20px] font-semibold tracking-[-.03em] text-[#28392e]">{title}</h2>
+        <p className="mt-2 min-h-[40px] text-[12px] leading-5 text-[#77847c]">{description}</p>
+        <div className="mt-5 flex flex-wrap gap-2 text-[10px] font-medium text-[#68766d]">
+          <span className="rounded-full bg-[#f3f6f3] px-3 py-1.5">Time · {time}</span>
+          <span className="rounded-full bg-[#f3f6f3] px-3 py-1.5">Difficulty · {difficulty}</span>
+        </div>
+        <Link to={`/assessments/${slug}`} state={slug === "full" ? undefined : { freshAssessment: true }} className="primary-glow mt-6 inline-flex w-fit items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white transition hover:bg-[#28523d]">
+          Start <ArrowRight size={14} />
+        </Link>
+      </article>)}
+    </div>
+  </main></PageFrame>;
+}
+
+function Pill({ children, tone = "gray", verified = false }: { children: React.ReactNode; tone?: "green" | "amber" | "red" | "gray"; verified?: boolean }) {
   const styles = { green: "bg-[#eaf5ed] text-[#39734d]", amber: "bg-[#fff4df] text-[#9b6b22]", red: "bg-[#fceceb] text-[#a34c47]", gray: "bg-[#eef1ef] text-[#68756d]" };
-  return <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-semibold ${styles[tone]}`}>{children}</span>;
+  return <span className={`ui-pill${verified ? " ui-pill-verified" : ""} inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-semibold ${styles[tone]}`}>{children}</span>;
 }
 
-function ConsentStart({ onStart }: { onStart: (name: string, email: string, extraTime: boolean) => Promise<void> }) {
+function ConsentStart({ onStart, children }: { onStart: (name: string, email: string, extraTime: boolean) => Promise<void>; children?: ReactNode }) {
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [consent, setConsent] = useState(false);
@@ -575,6 +930,7 @@ function ConsentStart({ onStart }: { onStart: (name: string, email: string, extr
       <label className="mt-2 block text-[11px] font-semibold text-[#57655d]">Email <span className="font-normal text-[#9aa49c]">(optional)</span>
         <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" className="mt-1.5 w-full rounded-xl border border-[#e2e8e3] bg-white px-3.5 py-3 text-[13px] font-normal outline-none transition focus:border-[#81af8c] focus:ring-4 focus:ring-[#e5f1e8]" />
       </label>
+      {children}
       <label className="mt-3 flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#67756c]"><input type="checkbox" checked={extraTime} onChange={(event) => setExtraTime(event.target.checked)} className="mt-0.5 accent-[#477e55]" />Accessibility option: add five minutes to the assessment timer.</label>
       {error && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-3 py-2 text-[11px] text-[#a34c47]">{error}</p>}
       <button disabled={!consent || !name.trim() || starting} onClick={start} className="primary-glow mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad]">{starting ? "Preparing your task…" : "I consent and start"} {!starting && <ArrowRight size={15} />}</button>
@@ -583,8 +939,96 @@ function ConsentStart({ onStart }: { onStart: (name: string, email: string, extr
   </div>;
 }
 
-function Assessment() {
+function isAssessmentTrack(track: string | undefined): track is AssessmentTrack {
+  return track === "problem-solver" || track === "skill" || track === "adapt";
+}
+
+function FullAssessmentRoute() {
+  const flow = useAssessmentFlow();
   const navigate = useNavigate();
+  useEffect(() => {
+    flow.startFull();
+    navigate("/assessments/problem-solver", { replace: true, state: { fullSequence: true } });
+  }, [flow.startFull, navigate]);
+  return <PageFrame><main className="mx-auto max-w-3xl px-5 py-20 text-sm text-[#849087]">Preparing your full assessment…</main></PageFrame>;
+}
+
+function AssessmentTrackRoute() {
+  const { track: routeTrack } = useParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const flow = useAssessmentFlow();
+  const validTrack = isAssessmentTrack(routeTrack);
+  const track = validTrack ? routeTrack : null;
+  const isCurrentJourneyStep = Boolean(track && flow.journey.active &&
+    flow.journey.tracks[flow.journey.currentIndex] === track);
+
+  useEffect(() => {
+    if (!track) return;
+    if (location.state?.freshAssessment) {
+      flow.startSingle(track);
+      navigate(location.pathname, { replace: true, state: null });
+      return;
+    }
+    if (!isCurrentJourneyStep) flow.startSingle(track);
+  }, [flow.startSingle, isCurrentJourneyStep, location.pathname, location.state, navigate, track]);
+
+  if (!track) return <Navigate to="/assessments" replace />;
+  return <Assessment key={track} track={track} />;
+}
+
+function TrackResultScreen() {
+  const { id = "" } = useParams();
+  const flow = useAssessmentFlow();
+  const navigate = useNavigate();
+  const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    api.candidate(id).then(setCandidate)
+      .catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load assessment results."));
+  }, [id]);
+
+  if (error) return <PageFrame><main className="mx-auto max-w-2xl px-5 py-16"><p role="alert" className="rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</p></main></PageFrame>;
+  if (!candidate) return <PageFrame><main className="mx-auto max-w-2xl px-5 py-16 text-sm text-[#849087]">Loading your result…</main></PageFrame>;
+
+  const track = isAssessmentTrack(candidate.track) ? candidate.track : "skill";
+  const result = candidate.track_results?.find((item) => item.track === track);
+  const nextTrack = flow.journey.tracks[flow.journey.currentIndex + 1];
+  const continueJourney = () => {
+    const next = flow.advance();
+    if (next) navigate(`/assessments/${next}`, { state: { fullSequence: true } });
+    else navigate("/assessments");
+  };
+
+  return <PageFrame><main className="mx-auto max-w-[760px] px-5 py-12 sm:py-16">
+    <div className="rounded-[24px] border border-[#e5ebe6] bg-white p-7 text-center shadow-[0_12px_50px_#17321b0a] sm:p-10">
+      <span className="mx-auto grid size-12 place-items-center rounded-2xl bg-[#eaf5ed] text-[#4c805a]"><CheckCircle2 size={24} /></span>
+      <p className="mt-5 text-[10px] font-semibold uppercase tracking-[.15em] text-[#7b927f]">{nextTrack ? "Track complete" : "Assessment complete"}</p>
+      <h1 className="app-page-title mt-2 text-[30px] font-semibold tracking-[-.05em]">{track === "problem-solver" ? "Problem Solver" : track === "adapt" ? "Adapt" : "Skill"} result</h1>
+      {result ? <><div className="mt-5 text-[54px] font-semibold tracking-[-.07em] text-[#315d3e]">{result.score}<span className="text-[18px] text-[#91a196]">/100</span></div><p className="mt-2 text-[12px] text-[#738078]">{result.domain} · Your evidence has been saved.</p></> : <p className="mt-4 text-[12px] text-[#738078]">Your result is being prepared. Refresh this page if it does not appear.</p>}
+      {track === "skill" && candidate.viva.length > 0 && <div className="mt-7 space-y-2 text-left">
+        <h2 className="text-[11px] font-semibold text-[#56645b]">AI viva · scored answers</h2>
+        {candidate.viva.map((answer, index) => <div key={`${answer.question}-${index}`} className="rounded-xl border border-[#e7ece8] bg-[#fafcfb] px-4 py-3">
+          <div className="flex items-start justify-between gap-3"><p className="text-[10px] font-medium leading-5 text-[#59685e]">{answer.question}</p><span className="shrink-0 rounded-full bg-[#edf5ef] px-2.5 py-1 text-[9px] font-semibold text-[#4c805a]">{answer.score === null ? "—" : `${(answer.score / 10).toFixed(1)}/10`}</span></div>
+          {answer.feedback && <p className="mt-1 text-[9px] leading-4 text-[#89958d]">{answer.feedback}</p>}
+        </div>)}
+      </div>}
+      <div className="mt-7 flex flex-wrap justify-center gap-3">
+        {nextTrack && <button onClick={continueJourney} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white hover:bg-[#28523d]">Continue to next track <ArrowRight size={14} /></button>}
+        <Link to={`/candidates/${candidate.id}`} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-5 py-3 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">View evidence report <ArrowRight size={14} /></Link>
+        {!nextTrack && <Link to="/assessments" className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-5 py-3 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">Back to assessments <ArrowRight size={14} /></Link>}
+      </div>
+    </div>
+  </main></PageFrame>;
+}
+
+function Assessment({ track }: { track: AssessmentTrack }) {
+  const flow = useAssessmentFlow();
+  const navigate = useNavigate();
+  const [trackCatalog, setTrackCatalog] = useState<TracksCatalog | null>(null);
+  const [domain, setDomain] = useState(defaultTrackDomain[track]);
+  const [skillDomainReady, setSkillDomainReady] = useState(false);
   const [sessionId, setSessionId] = useState("");
   const [consent, setConsent] = useState(false);
   const [extraTime, setExtraTime] = useState(false);
@@ -594,6 +1038,11 @@ function Assessment() {
   const [taskVariant, setTaskVariant] = useState<TaskVariant | null>(null);
   const [events, setEvents] = useState<TimelineEvent[]>([]);
   const [prompts, setPrompts] = useState<Candidate["ai_prompts"]>([]);
+  const [bugNotes, setBugNotes] = useState("");
+  const [whyNotes, setWhyNotes] = useState("");
+  const [testRuns, setTestRuns] = useState(0);
+  const [testResults, setTestResults] = useState<boolean[] | null>(null);
+  const [firstFixSeconds, setFirstFixSeconds] = useState<number | null>(null);
   const [elapsed, setElapsed] = useState(0);
   const [timeRemaining, setTimeRemaining] = useState(20 * 60);
   const [requirementUpdate, setRequirementUpdate] = useState("");
@@ -603,6 +1052,8 @@ function Assessment() {
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [assistantOpen, setAssistantOpen] = useState(true);
+  const [autoStartError, setAutoStartError] = useState("");
+  const [autoStarting, setAutoStarting] = useState(false);
   const startAt = useRef(0);
   const codeRef = useRef(code);
   const eventCount = useRef(0);
@@ -612,6 +1063,24 @@ function Assessment() {
   const flushInProgress = useRef(false);
   const lastActivity = useRef(Date.now());
   const idleStarted = useRef(0);
+  const assistantCodeSnapshots = useRef(new Map<string, string>());
+  const trackDefinition: TrackDefinition | undefined = trackCatalog?.tracks[track];
+  const availableDomains = trackDefinition?.domains || [];
+  const domainDefinition = trackCatalog?.domains[domain];
+  const practicalTask = domainDefinition?.kind === "practical";
+  const skillDomainGate = track === "skill" && flow.journey.tracks.length > 1 && Boolean(flow.journey.profile);
+
+  useEffect(() => {
+    let active = true;
+    api.tracks().then((catalog) => {
+      if (!active) return;
+      setTrackCatalog(catalog);
+      if (!catalog.tracks[track].domains.includes(domain)) setDomain(catalog.tracks[track].domains[0]);
+    }).catch((issue) => {
+      if (active) setError(issue instanceof Error ? issue.message : "Could not load assessment tracks.");
+    });
+    return () => { active = false; };
+  }, [track]);
 
   const stamp = useCallback(() => {
     const seconds = Math.floor((Date.now() - startAt.current) / 1000);
@@ -695,7 +1164,7 @@ function Assessment() {
   }, [consent, extraTime, flushEvents, pushEvent, sessionId]);
 
   useEffect(() => {
-    if (!sessionId || !consent) return;
+    if (!sessionId || !consent || track !== "adapt" || requirementUpdate) return;
     let active = true;
     const check = async () => {
       try {
@@ -708,9 +1177,9 @@ function Assessment() {
       }
     };
     void check();
-    const timer = window.setInterval(() => { void check(); }, 3000);
+    const timer = window.setInterval(() => { void check(); }, 1000);
     return () => { active = false; window.clearInterval(timer); };
-  }, [consent, requirementUpdate, sessionId]);
+  }, [consent, requirementUpdate, sessionId, track]);
 
   const onEditorMount = (editor: Parameters<NonNullable<ComponentProps<typeof Editor>["onMount"]>>[0]) => {
     editor.onDidChangeModelContent((change) => {
@@ -742,31 +1211,61 @@ function Assessment() {
     setError("");
     try {
       const result = await api.sessionAssistant(sessionId, value);
+      assistantCodeSnapshots.current.set(result.prompt.id, codeRef.current);
       setPrompts((current) => [...current, {
         id: result.prompt.id,
         prompt: value,
         response: result.answer,
         verified: false,
-        seeded_mistake: result.prompt.seeded_mistake,
+        caught: false,
+        edited_after: false,
         summary: summarizePrompt(value),
       }]);
     } catch (issue) { setError(issue instanceof Error ? issue.message : "Assistant unavailable."); }
     finally { setAssistantBusy(false); }
   }
-  async function markSuggestion(item: Candidate["ai_prompts"][number], verified: boolean) {
+  async function markSuggestion(item: Candidate["ai_prompts"][number], kind: "tested" | "caught", checked: boolean) {
     if (!sessionId || !item.id) return;
+    const verified = kind === "tested" ? checked || Boolean(item.caught) : checked || item.verified;
+    const caught = kind === "caught" ? checked : item.caught;
     try {
-      await api.verifyPrompt(sessionId, item.id, verified);
+      await api.verifyPrompt(sessionId, item.id, { verified, caught });
       setPrompts((current) => current.map((promptItem) => promptItem.id === item.id ? {
         ...promptItem,
         verified,
-        summary: verified ? "Candidate marked the suggestion as checked and understood." : "Prompt sent; candidate has not marked it as checked.",
+        caught,
+        summary: caught ? "Candidate reported finding a potential error in the suggestion."
+          : verified ? "Candidate reported testing the suggestion." : "Candidate has not reported testing the suggestion.",
       } : promptItem));
     } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not save your verification."); }
   }
-  function runSampleChecks() {
+  function changeWork(value: string, recordEvent = true) {
+    codeRef.current = value;
+    setCode(value);
+    if (recordEvent && recordingEnabled.current) pushEvent({ type: "edit", detail: "Edited assessment work", count: 1, characters: value.length });
+    if (track !== "adapt") return;
+    const changedPrompts = prompts.filter((item) => item.id && !item.edited_after &&
+      assistantCodeSnapshots.current.get(item.id) !== value);
+    if (!changedPrompts.length) return;
+    setPrompts((current) => current.map((item) => changedPrompts.some((changed) => changed.id === item.id)
+      ? { ...item, edited_after: true } : item));
+    changedPrompts.forEach((item) => {
+      if (!item.id) return;
+      void api.verifyPrompt(sessionId, item.id, {
+        verified: item.verified,
+        ...(typeof item.caught === "boolean" ? { caught: item.caught } : {}),
+        edited_after: true,
+      }).catch((issue) => setError(issue instanceof Error ? issue.message : "Could not save your edit evidence."));
+    });
+  }
+  function runChecks() {
     if (!recordingEnabled.current) return;
-    pushEvent({ type: "run", detail: "Recorded a sample-check attempt; editor code was not executed." });
+    const results = checksForWork(track, domain, codeRef.current, taskVariant, Boolean(requirementUpdate));
+    const nextRuns = testRuns + 1;
+    setTestRuns(nextRuns);
+    setTestResults(results);
+    pushEvent({ type: "run", detail: `Ran ${track === "problem-solver" ? "failing tests" : track === "adapt" ? "verification checks" : "build checks"}`, count: nextRuns });
+    if (track === "problem-solver" && firstFixSeconds === null && results.some(Boolean)) setFirstFixSeconds(elapsed);
   }
   async function submit() {
     if (!sessionId) return;
@@ -776,87 +1275,192 @@ function Assessment() {
       const flushed = await flushEvents();
       if (!flushed || eventQueue.current.length) throw new Error("Your activity timeline could not be saved. Please try submitting again.");
       const saved = await api.submitAssessment({ name, email, code: codeRef.current, consent: true, session_id: sessionId, events, ai_prompts: prompts, duration_seconds: elapsed, keystrokes: keypresses.current });
-      await api.questions(saved.id, taskVariant?.description);
-      navigate(`/viva/${saved.id}`);
+      if (track === "skill") {
+        await api.questions(saved.id, taskVariant?.description || codeRef.current);
+        navigate(`/viva/${saved.id}`);
+      } else {
+        const testScore = testResults?.length
+          ? Math.round(testResults.filter(Boolean).length / testResults.length * 100)
+          : 0;
+        const signals = trackSignals(saved.candidate, testScore, `${bugNotes}\n${whyNotes}`);
+        const evidence = {
+          bug_notes: bugNotes,
+          explanation: whyNotes,
+          test_runs: testRuns,
+          tests: testResults,
+          time_to_first_fix_seconds: firstFixSeconds,
+          requirement_change_seen: Boolean(requirementUpdate),
+          prompts: prompts.map(({ prompt: question, verified, caught, edited_after }) => ({ prompt: question, verified, caught, edited_after })),
+        };
+        await api.submitTrackResult(sessionId, {
+          track,
+          domain,
+          task_variant: taskVariant?.id || "",
+          signals,
+          evidence,
+        });
+        navigate(`/assessments/result/${saved.id}`);
+      }
     } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not submit assessment."); }
     finally { setSubmitting(false); }
   }
-  async function startSession(candidateName: string, candidateEmail: string, extraTime: boolean) {
-    const session = await api.startSession(candidateName, candidateEmail, extraTime);
+  const startSession = useCallback(async (candidateName: string, candidateEmail: string, extraTime: boolean) => {
+    const session = await api.startTrackSession(candidateName, candidateEmail, extraTime, track, domain);
+    setError("");
+    flow.rememberProfile({ name: candidateName, email: candidateEmail, extraTime });
     setName(candidateName);
     setEmail(candidateEmail);
     setExtraTime(extraTime);
     setSessionId(session.session_id);
     setTaskVariant(session.task_variant);
-    setCode(`function groupBy${session.task_variant.field[0].toUpperCase()}${session.task_variant.field.slice(1)}(items) {\n  return items.reduce((groups, item) => {\n    const value = item.${session.task_variant.field};\n    (groups[value] ??= []).push(item);\n    return groups;\n  }, {});\n}`);
-    codeRef.current = `function groupBy${session.task_variant.field[0].toUpperCase()}${session.task_variant.field.slice(1)}(items) {\n  return items.reduce((groups, item) => {\n    const value = item.${session.task_variant.field};\n    (groups[value] ??= []).push(item);\n    return groups;\n  }, {});\n}`;
+    setCode(starterForTask(session.task_variant, domain));
+    codeRef.current = starterForTask(session.task_variant, domain);
     setTimeRemaining(20 * 60 + (extraTime ? 300 : 0));
     setConsent(true);
-  }
+  }, [domain, flow.rememberProfile, track]);
+  const autoStartInProgress = useRef(false);
+  const autoStartNextTrack = useCallback(async (profile: AssessmentProfile) => {
+    if (autoStartInProgress.current) return;
+    autoStartInProgress.current = true;
+    setAutoStarting(true);
+    setAutoStartError("");
+    try {
+      await startSession(profile.name, profile.email, profile.extraTime);
+    } catch (issue) {
+      setAutoStartError(issue instanceof Error ? issue.message : "Could not start the next assessment.");
+    } finally {
+      autoStartInProgress.current = false;
+      setAutoStarting(false);
+    }
+  }, [startSession]);
+  useEffect(() => {
+    const profile = flow.journey.profile;
+    if (!profile || !flow.journey.active || flow.journey.tracks[flow.journey.currentIndex] !== track ||
+        sessionId || skillDomainGate && !skillDomainReady) return;
+    void autoStartNextTrack(profile);
+  }, [autoStartNextTrack, flow.journey, sessionId, skillDomainGate, skillDomainReady, track]);
   const time = `${String(Math.floor(timeRemaining / 60)).padStart(2, "0")}:${String(timeRemaining % 60).padStart(2, "0")}`;
+  const taskTitle = taskVariant?.title || trackDefinition?.tasks.find((task) => task.domain === domain)?.title || "Your task";
+  const checkLabels = track === "problem-solver"
+    ? taskVariant?.failingTests || ["Task-specific behavior", "Edge-case handling"]
+    : track === "adapt"
+      ? ["The task has a clear outcome", "Work reflects the updated requirement", "The output has been verified"]
+      : ["A solution is present", "The task requirements are addressed", "An edge case or verification is included"];
+  const shownTestResults = testResults || (track === "problem-solver" ? checkLabels.map(() => false) : null);
+  const canSubmit = Boolean(code.trim()) && (track !== "problem-solver" || Boolean(bugNotes.trim() && whyNotes.trim()));
+  const domainPicker = track === "skill" ? <label className="mt-3 block text-left text-[11px] font-semibold text-[#57655d]">Assessment domain
+    <select value={domain} onChange={(event) => setDomain(event.target.value)} className="mt-1.5 w-full rounded-xl border border-[#e2e8e3] bg-white px-3.5 py-3 text-[13px] font-normal outline-none transition focus:border-[#81af8c] focus:ring-4 focus:ring-[#e5f1e8]">
+      {availableDomains.map((domainId) => <option key={domainId} value={domainId}>{trackCatalog?.domains[domainId]?.title || domainId}</option>)}
+    </select>
+    {!availableDomains.length && <span className="mt-1 block text-[10px] font-normal text-[#9aa49c]">Loading available domains…</span>}
+  </label> : null;
 
   return <PageFrame>
-    {!consent && <ConsentStart onStart={startSession} />}
-    <main className="mx-auto max-w-[1370px] px-4 pb-8 pt-5 sm:px-6 lg:px-8">
+    {!consent && !flow.journey.profile && <ConsentStart onStart={startSession}>{domainPicker}</ConsentStart>}
+    {!consent && flow.journey.profile && (!skillDomainGate || skillDomainReady) && (autoStarting || autoStartError) && <div className="fixed inset-0 z-50 flex items-center justify-center bg-[#14221bcc] p-4 backdrop-blur-sm">
+      <div className="w-full max-w-[420px] rounded-[24px] border border-white/80 bg-[#fbfcfa] p-6 text-center shadow-2xl">
+        <p className="text-sm font-semibold text-[#33483a]">{autoStarting ? "Preparing the next assessment…" : "The next assessment could not start."}</p>
+        {autoStartError && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-3 py-2 text-[11px] text-[#a34c47]">{autoStartError}</p>}
+        {!autoStarting && <button onClick={() => void autoStartNextTrack(flow.journey.profile!)} className="primary-glow mt-4 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white">Retry</button>}
+      </div>
+    </div>}
+    {!consent && skillDomainGate && !skillDomainReady && <main className="mx-auto max-w-[760px] px-5 py-12 sm:py-16">
+      <div className="rounded-[24px] border border-[#e5ebe6] bg-white p-7 shadow-[0_12px_50px_#17321b0a] sm:p-9">
+        <p className="text-[10px] font-semibold uppercase tracking-[.15em] text-[#7b927f]">Full assessment · Track 2 of 3</p>
+        <h1 className="app-page-title mt-3 text-[30px] font-semibold tracking-[-.05em]">Choose your Skill domain.</h1>
+        <p className="mt-2 text-[12px] leading-5 text-[#748078]">Your consent from the start of this full assessment still applies. Recording begins when you start this task.</p>
+        <label className="mt-5 block text-[11px] font-semibold text-[#57655d]">Assessment domain
+          <select value={domain} onChange={(event) => setDomain(event.target.value)} className="mt-1.5 w-full rounded-xl border border-[#e2e8e3] bg-white px-3.5 py-3 text-[13px] font-normal outline-none transition focus:border-[#81af8c] focus:ring-4 focus:ring-[#e5f1e8]">
+            {availableDomains.map((domainId) => <option key={domainId} value={domainId}>{trackCatalog?.domains[domainId]?.title || domainId}</option>)}
+          </select>
+        </label>
+        {error && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-3 py-2 text-[11px] text-[#a34c47]">{error}</p>}
+        <button onClick={() => { setError(""); setSkillDomainReady(true); }} disabled={!availableDomains.includes(domain)} className="primary-glow mt-5 inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">Start Skill task <ArrowRight size={14} /></button>
+      </div>
+    </main>}
+    {(!skillDomainGate || skillDomainReady || consent) && <main className="mx-auto max-w-[1370px] px-4 pb-8 pt-5 sm:px-6 lg:px-8">
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-        <div className="flex items-center gap-2 text-xs text-[#87938b]"><Link to="/" className="hover:text-[#395c44]">Home</Link><ChevronRight size={13} /><span className="font-medium text-[#3d4d43]">Assessment</span></div>
+        <div className="flex items-center gap-2 text-xs text-[#87938b]"><Link to="/" className="hover:text-[#395c44]">Home</Link><ChevronRight size={13} /><Link to="/assessments" className="hover:text-[#395c44]">Assessments</Link><ChevronRight size={13} /><span className="font-medium text-[#3d4d43]">{trackDefinition?.title || "Assessment"}</span></div>
         <div className="flex items-center gap-2">
           <span role="status" title={consent ? "Recording process with consent" : "Recording paused"} aria-label={consent ? "Recording process with consent" : "Recording paused"} className={`flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[10px] font-semibold ${consent ? "bg-[#eaf5ed] text-[#43805a]" : "bg-[#eff2ef] text-[#78857d]"}`}>
             <Radio size={13} /><span className={`size-1.5 rounded-full ${consent ? "animate-pulse bg-[#4eaa6a]" : "bg-[#a6b0a9]"}`} /><span className="hidden sm:inline">{consent ? "Recording" : "Paused"}</span>
           </span>
-          <span role="timer" title={`${time} remaining`} aria-label={`${time} remaining`} className="inline-flex items-center gap-1.5 rounded-full border border-[#e4eae5] bg-white px-3 py-1.5 text-[11px] tabular-nums text-[#65736a]"><Clock3 size={13} />{time}<span className="hidden sm:inline">left</span></span>
+          {consent && <span role="timer" title={`${time} remaining`} aria-label={`${time} remaining`} className="inline-flex items-center gap-1.5 rounded-full border border-[#e4eae5] bg-white px-3 py-1.5 text-[11px] tabular-nums text-[#65736a]"><Clock3 size={13} />{time}<span className="hidden sm:inline">left</span></span>}
         </div>
       </div>
       {requirementUpdate && <div role="status" className="requirement-banner mb-4 rounded-2xl border border-[#f0dfbd] bg-[#fff9eb] px-5 py-3.5 text-[12px] leading-5 text-[#82652e]"><strong>Requirement update:</strong> {requirementUpdate}</div>}
-      <div className="grid items-start gap-4 xl:grid-cols-[270px_minmax(0,1fr)_300px]">
+      <div className={`grid items-start gap-4 ${track === "adapt" ? "xl:grid-cols-[270px_minmax(0,1fr)_300px]" : "xl:grid-cols-[270px_minmax(0,1fr)]"}`}>
         <aside className="rounded-[20px] border border-[#e5ebe6] bg-white p-5 shadow-[0_6px_25px_#17321b08]">
-          <div className="flex items-center gap-2"><span className="grid size-8 place-items-center rounded-lg bg-[#edf5ef] text-[#4c7b5b]"><FileCode2 size={16} /></span><div><h1 className="text-[13px] font-semibold">{taskVariant?.title || "Your task"}</h1><Pill tone="gray">JavaScript</Pill></div></div>
+          <div className="flex items-center gap-2"><span className="grid size-8 place-items-center rounded-lg bg-[#edf5ef] text-[#4c7b5b]"><FileCode2 size={16} /></span><div><h1 className="app-context-title text-[13px] font-semibold">{taskTitle}</h1><Pill tone="gray">{domainDefinition?.title || domain}</Pill></div></div>
           <h2 className="mt-5 text-[10px] font-semibold uppercase tracking-[.11em] text-[#819087]">Task description</h2>
           <p className="mt-2 text-[12px] leading-5 text-[#55645b]">{taskVariant?.description || "Prepare your individualized task."}</p>
-          <h2 className="mt-5 text-[10px] font-semibold uppercase tracking-[.11em] text-[#819087]">Sample records</h2>
-          <pre className="mt-2 overflow-auto rounded-xl bg-[#f7faf7] p-3 text-[10px] leading-5 text-[#66756b]">{JSON.stringify(taskVariant?.dataset || [], null, 2)}</pre>
-          <h2 className="mt-5 text-[10px] font-semibold uppercase tracking-[.11em] text-[#819087]">Consider</h2>
-          <ul className="mt-2 space-y-2 text-[11px] leading-5 text-[#627168]"><li>What should happen with empty input?</li><li>How should missing or special keys behave?</li><li>What will you test after changing your approach?</li></ul>
-          <p className="mt-5 rounded-xl border border-[#e8ece8] bg-[#fafcfb] p-3 text-[10px] leading-4 text-[#89958d]">Your sample checks are recorded but do not execute candidate code in this demo.</p>
+          {taskVariant?.dataset && <><h2 className="mt-5 text-[10px] font-semibold uppercase tracking-[.11em] text-[#819087]">Sample records</h2><pre className="mt-2 overflow-auto rounded-xl bg-[#f7faf7] p-3 text-[10px] leading-5 text-[#66756b]">{JSON.stringify(taskVariant.dataset, null, 2)}</pre></>}
+          {track === "problem-solver" && <div className="mt-5 space-y-3">
+            <label className="block text-[10px] font-semibold text-[#66766c]">Bugs found
+              <textarea value={bugNotes} onChange={(event) => setBugNotes(event.target.value)} rows={3} placeholder="List each bug you noticed…" className="mt-2 w-full resize-y rounded-xl border border-[#e3e9e4] bg-[#fafcfb] p-3 text-[11px] leading-5 outline-none focus:border-[#81af8c] focus:ring-4 focus:ring-[#e7f2e9]" />
+            </label>
+            <label className="block text-[10px] font-semibold text-[#66766c]">What is wrong and why?
+              <textarea value={whyNotes} onChange={(event) => setWhyNotes(event.target.value)} rows={4} placeholder="Explain the behavior you found and why it fails…" className="mt-2 w-full resize-y rounded-xl border border-[#e3e9e4] bg-[#fafcfb] p-3 text-[11px] leading-5 outline-none focus:border-[#81af8c] focus:ring-4 focus:ring-[#e7f2e9]" />
+            </label>
+          </div>}
+          {track === "adapt" && <p className="mt-5 rounded-xl border border-[#e8ece8] bg-[#fafcfb] p-3 text-[10px] leading-4 text-[#89958d]">After three minutes, a new requirement appears. Check assistant advice, test your output, and revise it when needed.</p>}
         </aside>
         <section className="overflow-hidden rounded-[20px] border border-[#e5ebe6] bg-white shadow-[0_6px_25px_#17321b08]">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ed] px-5 py-4">
-            <div><h2 className="text-[13px] font-semibold">Solution editor</h2><p className="mt-1 text-[10px] text-[#89958d]">Make changes in small steps and verify edge cases.</p></div>
+            <div><h2 className="text-[13px] font-semibold">{practicalTask ? "Written response" : track === "problem-solver" ? "Broken mini-project" : "Solution editor"}</h2><p className="mt-1 text-[10px] text-[#89958d]">{track === "problem-solver" ? "Find the defects, explain them, and repair the failing checks." : track === "adapt" ? "Start with the task, then respond to the updated requirement." : "Build the task in your selected domain and prepare to explain your choices."}</p></div>
           </div>
-          <div className="editor-shell h-[430px] overflow-hidden bg-[#111b18] sm:h-[500px]">
-            <Editor height="100%" defaultLanguage="javascript" theme="vs-dark" value={code} onChange={(value) => { codeRef.current = value || ""; setCode(value || ""); }} onMount={onEditorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineHeight: 23, padding: { top: 18 }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2, automaticLayout: true, renderLineHighlight: "line", guides: { indentation: true }, scrollbar: { verticalScrollbarSize: 7 } }} />
-          </div>
+          {practicalTask
+            ? <textarea aria-label="Assessment written response" value={code} onChange={(event) => changeWork(event.target.value)} onKeyDown={(event) => {
+              if (!recordingEnabled.current || ["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(event.key)) return;
+              keypresses.current += 1;
+              setKeypressCount(keypresses.current);
+            }} rows={18} className="min-h-[430px] w-full resize-y bg-[#111b18] p-5 font-mono text-[12px] leading-6 text-[#c0d0c4] outline-none sm:min-h-[500px]" />
+            : <div className="editor-shell h-[430px] overflow-hidden bg-[#111b18] sm:h-[500px]">
+              <Editor height="100%" defaultLanguage={domain} theme="vs-dark" value={code} onChange={(value) => changeWork(value || "", false)} onMount={onEditorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineHeight: 23, padding: { top: 18 }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2, automaticLayout: true, renderLineHighlight: "line", guides: { indentation: true }, scrollbar: { verticalScrollbarSize: 7 } }} />
+            </div>}
+          {(track === "problem-solver" || testResults) && <div className="border-t border-[#edf0ed] px-5 py-4">
+            <div className="flex flex-wrap items-center justify-between gap-2"><h3 className="text-[11px] font-semibold text-[#56645b]">{track === "problem-solver" ? "Failing test suite" : track === "adapt" ? "Verification checks" : "Build checks"}</h3><span className="text-[9px] text-[#98a29b]">{testRuns} run{testRuns === 1 ? "" : "s"}{track === "problem-solver" && firstFixSeconds !== null ? ` · First fix at ${Math.floor(firstFixSeconds / 60)}:${String(firstFixSeconds % 60).padStart(2, "0")}` : ""}</span></div>
+            <div className="mt-2 space-y-1.5">{checkLabels.map((label, index) => {
+              const passed = shownTestResults?.[index] ?? false;
+              return <div key={label} className="flex items-center justify-between rounded-lg bg-[#fafcfb] px-3 py-2 text-[10px]"><span className="text-[#748078]">{label}</span><span className={`font-semibold ${passed ? "text-[#4c805a]" : "text-[#a34c47]"}`}>{passed ? "Passed" : "Failed"}</span></div>;
+            })}</div>
+            <p className="mt-2 text-[9px] leading-4 text-[#98a29b]">Demo checks use task-specific patterns and do not execute the submitted code.</p>
+          </div>}
           <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0ed] bg-[#fcfdfb] px-5 py-3">
             <div className="flex flex-wrap items-center gap-3 text-[10px] text-[#8a968f]"><span className="flex items-center gap-1.5"><Code2 size={12} />{eventCount.current} edits</span><span className="flex items-center gap-1.5"><KeyRound size={12} />{keypressCount} keys</span><span className="flex items-center gap-1.5"><Upload size={12} />{events.filter((item) => item.type === "paste").length} pastes</span></div>
             <div className="flex items-center gap-2">
-              <button type="button" onClick={() => setAssistantOpen((open) => !open)} title={assistantOpen ? "Hide AI assistant" : "AI assistant"} aria-label={assistantOpen ? "Hide AI assistant" : "AI assistant"} aria-pressed={assistantOpen} className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3.5 py-2.5 text-[10px] font-semibold text-[#52645a] hover:bg-[#f5f9f6]">
+              {track === "adapt" && <button type="button" onClick={() => setAssistantOpen((open) => !open)} title={assistantOpen ? "Hide AI assistant" : "AI assistant"} aria-label={assistantOpen ? "Hide AI assistant" : "AI assistant"} aria-pressed={assistantOpen} className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3.5 py-2.5 text-[10px] font-semibold text-[#52645a] hover:bg-[#f5f9f6]">
                 <Sparkles size={14} /><span className="hidden sm:inline">{assistantOpen ? "Hide assistant" : "AI assistant"}</span>
-              </button>
-              <button type="button" onClick={runSampleChecks} disabled={!consent} title="Run tests" aria-label="Run tests" className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3.5 py-2.5 text-[10px] font-semibold text-[#52645a] disabled:opacity-50">
-                <ClipboardCheck size={14} /><span className="hidden sm:inline">Run tests</span>
-              </button>
-              <button type="button" onClick={submit} disabled={!consent || submitting || assistantBusy} title={submitting ? "Preparing viva" : "Submit and continue"} aria-label={submitting ? "Preparing viva" : "Submit and continue"} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-3.5 py-2.5 text-[11px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad] sm:px-5">
-                <span className="hidden sm:inline">{submitting ? "Preparing viva…" : "Submit"}</span><ArrowRight size={14} />
+              </button>}
+              {(track !== "skill" || !practicalTask) && <button type="button" onClick={runChecks} disabled={!consent} title={track === "problem-solver" ? "Run tests" : "Run checks"} aria-label={track === "problem-solver" ? "Run tests" : "Run checks"} className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3.5 py-2.5 text-[10px] font-semibold text-[#52645a] disabled:opacity-50">
+                <ClipboardCheck size={14} /><span className="hidden sm:inline">{track === "problem-solver" ? "Run tests" : track === "skill" ? "Run build checks" : "Run checks"}</span>
+              </button>}
+              <button type="button" onClick={submit} disabled={!consent || !canSubmit || submitting || assistantBusy} title={submitting ? "Saving task" : "Submit task"} aria-label={submitting ? "Saving task" : "Submit task"} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-3.5 py-2.5 text-[11px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad] sm:px-5">
+                <span className="hidden sm:inline">{submitting ? "Saving…" : track === "skill" ? "Submit & start viva" : "Finish track"}</span><ArrowRight size={14} />
               </button>
             </div>
           </div>
           {error && <p role="alert" className="border-t border-[#f3d7d4] bg-[#fff7f6] px-5 py-3 text-xs text-[#a34c47]">{error}</p>}
         </section>
-        <aside className={`${assistantOpen ? "block" : "hidden"} overflow-hidden rounded-[20px] border border-[#e5ebe6] bg-white shadow-[0_6px_25px_#17321b08] xl:block`}>
+        {track === "adapt" && <aside className={`${assistantOpen ? "block" : "hidden"} overflow-hidden rounded-[20px] border border-[#e5ebe6] bg-white shadow-[0_6px_25px_#17321b08] xl:block`}>
           <div className="flex items-center justify-between border-b border-[#edf0ed] px-4 py-4"><div className="flex items-center gap-2.5"><span className="grid size-8 place-items-center rounded-lg bg-[#f0effb] text-[#7167a8]"><Sparkles size={15} /></span><div><h2 className="text-[12px] font-semibold">AI assistant</h2><p className="text-[10px] text-[#98a29b]">Hints, not answers</p></div></div><button onClick={() => setAssistantOpen(false)} className="text-[#98a29b] xl:hidden" aria-label="Close assistant"><X size={15} /></button></div>
           <div className="max-h-[440px] min-h-[280px] space-y-3 overflow-y-auto px-4 py-4">
             <div className="rounded-xl border border-[#eeeafa] bg-[#faf9ff] p-3.5"><div className="flex gap-2 text-[11px] leading-[1.65] text-[#6c668b]"><Lightbulb size={14} className="mt-0.5 shrink-0" />Ask about a concept, edge case, or tradeoff. Your prompts are shared with the hiring team so they can understand how you used assistance.</div></div>
             {assistantBusy && <div className="mt-4 flex items-center gap-2 text-[11px] text-[#7a718f]"><span className="size-1.5 animate-pulse rounded-full bg-[#8177bb]" />Thinking through a hint…</div>}
-            {prompts.map((item, index) => <div key={item.id || `${item.prompt}-${index}`} className="space-y-2 animate-rise"><div className="ml-5 rounded-xl bg-[#edf4ef] p-3 text-[10px] leading-4 text-[#52645a]">{item.prompt}</div><div className="mr-4 rounded-xl bg-[#f4f6f4] p-3 text-[10px] leading-[1.65] text-[#56645b]">{item.response}</div><label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#718078]"><input type="checkbox" checked={item.verified} onChange={(event) => void markSuggestion(item, event.target.checked)} className="mt-0.5 accent-[#477e55]" />I checked this suggestion and understand it</label></div>)}
+            {prompts.map((item, index) => <div key={item.id || `${item.prompt}-${index}`} className="space-y-2 animate-rise"><div className="ml-5 rounded-xl bg-[#edf4ef] p-3 text-[10px] leading-4 text-[#52645a]">{item.prompt}</div><div className="mr-4 rounded-xl bg-[#f4f6f4] p-3 text-[10px] leading-[1.65] text-[#56645b]">{item.response}</div>
+              <label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#718078]"><input type="checkbox" checked={item.verified} onChange={(event) => void markSuggestion(item, "tested", event.target.checked)} className="mt-0.5 accent-[#477e55]" />I tested this suggestion</label>
+              <label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#718078]"><input type="checkbox" checked={Boolean(item.caught)} onChange={(event) => void markSuggestion(item, "caught", event.target.checked)} className="mt-0.5 accent-[#477e55]" />I caught a possible mistake</label>
+              <p className="text-[9px] text-[#89958d]">{item.edited_after ? "Work edited after this answer." : "Edits made after this answer are recorded."}</p>
+            </div>)}
           </div>
           <form onSubmit={askAssistant} className="border-t border-[#edf0ed] bg-[#fcfdfb] p-3">
             <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Ask for a hint or explanation…" rows={3} className="w-full resize-none rounded-xl border border-[#e6ebe7] bg-white p-3 text-[11px] leading-5 outline-none focus:border-[#aaa3d0]" />
             <button disabled={!prompt.trim() || assistantBusy} className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-[#eceaf7] py-2.5 text-[11px] font-semibold text-[#6a6396] transition hover:bg-[#e1def2] disabled:opacity-50"><WandSparkles size={13} />Ask assistant</button>
           </form>
-        </aside>
+        </aside>}
       </div>
       <p className="mt-4 text-center text-[10px] text-[#9aa59d]">Your process is visible only to the hiring team you share it with. <Link className="underline underline-offset-2" to="/">Privacy details</Link></p>
-    </main>
+    </main>}
   </PageFrame>;
 }
 
@@ -888,14 +1492,33 @@ function Viva() {
       setLastFeedback({ score: result.score_10, reason: result.reason });
       setAnswer("");
       if (current + 1 < next.length) setCurrent(current + 1);
-      else navigate(`/live-check/${id}`);
+      else {
+        const candidate = await api.candidate(id);
+        if (candidate.session_id && isAssessmentTrack(candidate.track)) {
+          const liveCheck = candidate.code.trim() ? Math.round(checksForWork("skill", candidate.domain || "javascript", candidate.code, null, false).filter(Boolean).length / 3 * 100) : 0;
+          const signals = trackSignals(candidate, liveCheck);
+          await api.submitTrackResult(candidate.session_id, {
+            track: candidate.track,
+            domain: candidate.domain || "javascript",
+            task_variant: candidate.task_variant || "",
+            signals,
+            evidence: {
+              viva: next.map((item) => ({ question: item.question, score_10: item.score === null ? null : item.score / 10, reason: item.feedback })),
+              domain: candidate.domain || "javascript",
+            },
+          });
+          navigate(`/assessments/result/${id}`);
+        } else {
+          navigate(`/live-check/${id}`);
+        }
+      }
     } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not save your answer."); }
     finally { setBusy(false); }
   }
   return <PageFrame><main className="mx-auto max-w-[850px] px-5 py-10 sm:py-14">
     <Link to="/assessment" className="inline-flex items-center gap-2 text-[12px] font-medium text-[#718078] hover:text-[#375b43]"><ArrowLeft size={14} /> Back to task</Link>
     <div className="mt-8 rounded-[24px] border border-[#e5ebe6] bg-white p-6 shadow-[0_12px_50px_#17321b0a] sm:p-9">
-      <div className="flex items-start justify-between"><div><Pill><Sparkles size={11} /> AI viva</Pill><h1 className="mt-4 text-[30px] font-semibold tracking-[-.045em]">Talk us through your thinking.</h1><p className="mt-2 max-w-[560px] text-[13px] leading-6 text-[#748078]">A few short questions about the code you just wrote. Your answers help reviewers understand your reasoning, not your ability to memorize definitions.</p></div><span className="hidden size-11 place-items-center rounded-2xl bg-[#eef4ef] text-[#548164] sm:grid"><BrainCircuit size={21} /></span></div>
+      <div className="flex items-start justify-between"><div><Pill><Sparkles size={11} /> AI viva</Pill><h1 className="app-page-title mt-4 text-[30px] font-semibold tracking-[-.045em]">Talk us through your thinking.</h1><p className="mt-2 max-w-[560px] text-[13px] leading-6 text-[#748078]">A few short questions about the code you just wrote. Your answers help reviewers understand your reasoning, not your ability to memorize definitions.</p></div><span className="hidden size-11 place-items-center rounded-2xl bg-[#eef4ef] text-[#548164] sm:grid"><BrainCircuit size={21} /></span></div>
       <div className="mt-7 flex items-center gap-2">{questions.map((_, index) => <div key={index} className={`h-1.5 flex-1 rounded-full ${index <= current ? "bg-[#5a9a6d]" : "bg-[#e8ede9]"}`} />)}</div>
       <div className="mt-2 flex justify-between text-[10px] font-medium text-[#95a098]"><span>Question {questions.length ? current + 1 : 0} of {questions.length || 5}</span><span>About {Math.max(1, Math.ceil(((questions.length || 5) - current) * 0.4))} min remaining</span></div>
       {lastFeedback && <div role="status" className="mt-4 rounded-xl border border-[#e5ebe6] bg-[#f7faf7] px-4 py-3 text-[11px] leading-5 text-[#65736a]"><strong className="text-[#3f704c]">Previous answer: {lastFeedback.score}/10.</strong> {lastFeedback.reason}</div>}
@@ -914,6 +1537,7 @@ function Viva() {
 }
 
 function LiveCheckChallenge() {
+  const flow = useAssessmentFlow();
   const { id = "" } = useParams();
   const navigate = useNavigate();
   const [candidate, setCandidate] = useState<Candidate | null>(null);
@@ -1015,7 +1639,9 @@ function LiveCheckChallenge() {
         requirement_change_seen: requirementChanged,
       });
       const complete = await api.complete(id);
-      navigate(`/candidates/${complete.id}`);
+      const nextTrack = flow.advance();
+      if (nextTrack) navigate(`/assessments/${nextTrack}`, { state: { fullSequence: true } });
+      else navigate(`/candidates/${complete.id}`);
     } catch (issue) {
       setError(issue instanceof Error ? issue.message : "Could not save your live skill check.");
     } finally {
@@ -1029,7 +1655,7 @@ function LiveCheckChallenge() {
   if (candidate.live_check) return <PageFrame><main className="mx-auto max-w-[760px] px-5 py-14">
     <div className="rounded-[24px] border border-[#e5ebe6] bg-white p-7 text-center shadow-[0_12px_50px_#17321b0a]">
       <CheckCircle2 className="mx-auto text-[#4e9666]" size={28} />
-      <h1 className="mt-4 text-2xl font-semibold">Live skill check recorded</h1>
+      <h1 className="app-page-title mt-4 text-2xl font-semibold">Live skill check recorded</h1>
       <p className="mt-2 text-sm text-[#738078]">{candidate.live_check.passed} of {candidate.live_check.total} tests passed.</p>
       <Link to={`/candidates/${candidate.id}`} className="primary-glow mt-6 inline-flex rounded-full bg-[#1d3d2e] px-5 py-3 text-xs font-semibold text-white">View assessment report</Link>
     </div>
@@ -1038,7 +1664,7 @@ function LiveCheckChallenge() {
   return <PageFrame><main className="mx-auto max-w-[1050px] px-5 pb-12 pt-8">
     <Link to={`/viva/${id}`} className="inline-flex items-center gap-2 text-[11px] font-medium text-[#77847c]"><ArrowLeft size={13} /> Viva</Link>
     <div className="mt-5 flex flex-wrap items-end justify-between gap-4">
-      <div><Pill><Code2 size={11} /> Final practical check</Pill><h1 className="mt-3 text-[30px] font-semibold tracking-[-.05em]">Debug a grouping edge case.</h1><p className="mt-2 max-w-[640px] text-[13px] leading-6 text-[#748078]">A short, timed follow-up about a JavaScript object-key bug. Choose a fix, run the focused test suite, and explain the evidence in the report.</p></div>
+      <div><Pill><Code2 size={11} /> Final practical check</Pill><h1 className="app-page-title mt-3 text-[30px] font-semibold tracking-[-.05em]">Debug a grouping edge case.</h1><p className="mt-2 max-w-[640px] text-[13px] leading-6 text-[#748078]">A short, timed follow-up about a JavaScript object-key bug. Choose a fix, run the focused test suite, and explain the evidence in the report.</p></div>
       <div className={`rounded-2xl border px-4 py-3 ${remaining < 45 ? "border-[#f0d7d4] bg-[#fff6f5] text-[#a34c47]" : "border-[#e5ebe6] bg-white text-[#344b3b]"}`}><div className="text-[9px] font-semibold uppercase tracking-[.12em] opacity-70">Time remaining</div><div className="mt-1 flex items-center gap-2 font-mono text-2xl font-semibold"><Clock3 size={17} />{time}</div></div>
     </div>
     <div className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(280px,.7fr)]">
@@ -1097,7 +1723,7 @@ function LiveCheckChallenge() {
 function VerdictTone({ verdict }: { verdict: Candidate["verdict"] }) {
   const tone = verdict === "Verified skill" ? "green" : verdict === "Needs review" ? "amber" : "red";
   const Icon = verdict === "Verified skill" ? BadgeCheck : verdict === "Needs review" ? CircleHelp : Flag;
-  return <Pill tone={tone}><Icon size={12} />{verdict}</Pill>;
+  return <Pill tone={tone} verified={verdict === "Verified skill"}><Icon size={12} />{verdict}</Pill>;
 }
 
 function ScoreRing({ score, size = 68 }: { score: number; size?: number }) {
@@ -1106,11 +1732,88 @@ function ScoreRing({ score, size = 68 }: { score: number; size?: number }) {
   </div>;
 }
 
+const trackLabels: Record<string, string> = {
+  "problem-solver": "Problem Solver",
+  skill: "Skill",
+  adapt: "Adapt",
+};
+const domainLabels: Record<string, string> = {
+  javascript: "JavaScript",
+  python: "Python",
+  sql: "SQL",
+  marketing: "Marketing",
+  accounting: "Accounting",
+};
+
+function trackPassed(result: TrackResult | undefined) {
+  return Boolean(result && result.score >= 70 &&
+    result.signals.viva >= 70 && result.signals.liveCheck >= 70);
+}
+
+function TrackScoreRing({ result, track }: { result?: TrackResult; track: string }) {
+  const score = result?.score;
+  const color = score === undefined ? "#b9c3bc" : trackPassed(result) ? "#4e9666" : score < 45 ? "#be6b62" : "#b58b47";
+  return <div className="flex min-w-[54px] flex-col items-center gap-1" title={`${trackLabels[track]}: ${score === undefined ? "No score yet" : `${score}/100`}`}>
+    <div aria-label={`${trackLabels[track]} score ${score === undefined ? "not available" : `${score} out of 100`}`} className="relative grid size-9 place-items-center rounded-full" style={{ background: `conic-gradient(${color} ${score === undefined ? 0 : Math.max(0, Math.min(score, 100)) * 3.6}deg, #e9eee9 0deg)` }}>
+      <span className="grid size-[29px] place-items-center rounded-full bg-white text-[9px] font-semibold tabular-nums text-[#34483a]">{score === undefined ? "—" : score}</span>
+    </div>
+    <span className="text-center text-[8px] leading-3 text-[#869188]">{trackLabels[track]}</span>
+  </div>;
+}
+
+function passedTrackResults(candidate: Candidate) {
+  return (candidate.track_results || []).filter(trackPassed);
+}
+
+function trackSignalEvidence(result: TrackResult, signal: string, candidate: Candidate) {
+  const evidence = result.evidence;
+  const signalEvidence = evidence.signalEvidence;
+  if (signalEvidence && typeof signalEvidence === "object" &&
+      typeof (signalEvidence as Record<string, unknown>)[signal] === "string") {
+    return (signalEvidence as Record<string, string>)[signal];
+  }
+  const number = (key: string) => typeof evidence[key] === "number" ? Number(evidence[key]) : null;
+  const explanation = typeof evidence.explanation === "string" ? evidence.explanation : "";
+  if (signal === "viva") {
+    const answers = number("viva_answers");
+    return answers === null
+      ? explanation || "The score reflects the candidate’s explanation of their approach and decisions."
+      : `Answered ${answers} viva questions. ${explanation}`;
+  }
+  if (signal === "process") {
+    const runs = number("test_runs");
+    const edits = candidate.events.reduce((sum, event) => sum + (event.type === "edit" ? event.count : 0), 0);
+    return runs === null
+      ? `${edits} edit actions were recorded. ${explanation || "Review the process timeline alongside the finished work."}`
+      : `${runs} test runs and iterative work were recorded. ${explanation}`;
+  }
+  if (signal === "aiUsage") {
+    const tested = number("assistant_answers_tested");
+    const caught = number("assistant_mistakes_caught");
+    if (tested !== null || caught !== null) return `Tested ${tested ?? 0} assistant answers and identified ${caught ?? 0} potential mistakes.`;
+    const prompts = candidate.ai_prompts.length;
+    return prompts ? `${prompts} assistant answer${prompts === 1 ? "" : "s"} were recorded; review whether suggestions were checked.` : "No assistant use was recorded; AI use itself is not required or penalized.";
+  }
+  if (signal === "liveCheck") {
+    const passed = number("tests_passed");
+    const total = number("tests_total");
+    if (passed !== null && total !== null) return `${passed} of ${total} task checks passed. ${explanation}`;
+    return `${Math.round(result.signals.liveCheck)}% of the live-check signal. ${explanation || "See the recorded test evidence for details."}`;
+  }
+  if (signal === "timeAndPaste") {
+    const firstFix = number("time_to_first_fix_seconds");
+    if (firstFix !== null) return `First passing fix was recorded after ${Math.floor(firstFix / 60)}m ${firstFix % 60}s.`;
+    return `${Math.round(candidate.duration_seconds / 60)} minutes of work were recorded; time and pasting are contextual evidence, not proof by themselves.`;
+  }
+  return explanation || "This signal contributes context to the assessment.";
+}
+
 function Dashboard() {
   const [candidates, setCandidates] = useState<Candidate[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState("All");
+  const [trackFilter, setTrackFilter] = useState("all");
   const [query, setQuery] = useState("");
   useEffect(() => {
     api.candidates()
@@ -1120,8 +1823,9 @@ function Dashboard() {
   }, []);
   const filtered = useMemo(() => candidates.filter((candidate) =>
     (filter === "All" || candidate.verdict === filter) &&
+    (trackFilter === "all" || candidate.track_results?.some((result) => result.track === trackFilter)) &&
     `${candidate.name} ${candidate.role} ${candidate.task_variant || ""}`.toLowerCase().includes(query.toLowerCase()),
-  ), [candidates, filter, query]);
+  ), [candidates, filter, query, trackFilter]);
   const verified = candidates.filter((candidate) => candidate.verdict === "Verified skill").length;
   const review = candidates.filter((candidate) => candidate.verdict === "Needs review").length;
   const lowConfidence = candidates.filter((candidate) => candidate.verdict === "Low confidence").length;
@@ -1136,7 +1840,7 @@ function Dashboard() {
     </aside>
     <main className="min-w-0">
       <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div><p className="text-[9px] font-semibold uppercase tracking-[.16em] text-[#8e9b91]">Hiring workspace / Overview</p><h1 className="mt-1 text-[27px] font-semibold tracking-[-.05em] sm:text-[32px]">Candidate evidence</h1><p className="mt-1 text-[11px] text-[#7d8981]">Review the process, understanding, and context behind each assessment.</p></div>
+        <div><p className="text-[9px] font-semibold uppercase tracking-[.16em] text-[#8e9b91]">Hiring workspace / Overview</p><h1 className="app-page-title mt-1 text-[27px] font-semibold tracking-[-.05em] sm:text-[32px]">Candidate evidence</h1><p className="mt-1 text-[11px] text-[#7d8981]">Review the process, understanding, and context behind each assessment.</p></div>
         <label className="relative block w-full sm:max-w-[270px]"><span className="sr-only">Search candidates</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search candidates or tasks" className="w-full rounded-full border border-[#e3e9e4] bg-white px-4 py-3 text-[11px] outline-none transition focus:border-[#91b99a] focus:ring-4 focus:ring-[#e8f4eb]" /></label>
       </div>
       <div aria-busy={loading} className="mt-5 grid grid-cols-2 gap-3 xl:grid-cols-4">
@@ -1152,6 +1856,11 @@ function Dashboard() {
       </div>
       <section aria-busy={loading} className="mt-5 overflow-hidden rounded-[20px] border border-[#e6ece7] bg-white shadow-[0_8px_28px_#1c352808]">
         <div className="flex flex-col justify-between gap-3 border-b border-[#edf0ed] px-5 py-4 sm:flex-row sm:items-center"><div><h2 className="text-[14px] font-semibold">Recent assessments</h2><p className="mt-1 text-[10px] text-[#8b978f]">Evidence is a guide for human review, never an automated hiring decision.</p></div><Link to="/assessment" className="primary-glow inline-flex items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[10px] font-semibold text-white hover:bg-[#28523d]"><Plus size={13} /> Invite a candidate</Link></div>
+        <div role="group" aria-label="Filter candidates by track" className="flex flex-wrap gap-2 border-b border-[#edf0ed] px-5 py-3">
+          {[{ label: "All tracks", value: "all" }, ...Object.entries(trackLabels).map(([value, label]) => ({ label, value }))].map(({ label, value }) =>
+            <button key={value} type="button" onClick={() => setTrackFilter(value)} aria-pressed={trackFilter === value} className={`rounded-full border px-3.5 py-2 text-[10px] font-semibold transition ${trackFilter === value ? "border-[#c9dfce] bg-[#edf6ef] text-[#457351]" : "border-[#e8ece8] bg-white text-[#7e8982] hover:bg-[#f8faf8]"}`}>{label}</button>,
+          )}
+        </div>
         <div role="group" aria-label="Filter candidates by verdict" className="flex flex-wrap gap-2 border-b border-[#edf0ed] px-5 py-3">
           {[
             { label: "All", value: "All", icon: LayoutDashboard },
@@ -1164,7 +1873,11 @@ function Dashboard() {
         {loading && <div role="status" className="space-y-3 px-5 py-5"><span className="sr-only">Loading candidate assessments</span>{[0, 1, 2].map((row) => <div key={row} className="flex items-center gap-3 border-b border-[#f0f2f0] pb-4 last:border-0"><SkeletonLoader className="size-9 shrink-0 rounded-full" /><SkeletonLoader className="h-3 w-36 rounded" /><SkeletonLoader className="ml-auto h-5 w-20 rounded-full" /></div>)}</div>}
         {!loading && filtered.map((candidate) => <Link key={candidate.id} to={`/candidates/${candidate.id}`} className="group grid gap-3 border-t border-[#f0f2f0] px-5 py-4 transition hover:bg-[#fbfdfb] sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
           <div className="flex min-w-0 items-center gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-full bg-[#edf4ee] text-[11px] font-semibold text-[#487453]">{candidate.name.split(" ").map((word) => word[0]).join("")}</span><div className="min-w-0"><div className="truncate text-[12px] font-semibold group-hover:text-[#39734d]">{candidate.name}</div><div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[#8e9992]"><span>{candidate.role}</span><span>·</span><span>{candidate.task_variant || "Skills assessment"}</span><span>·</span><span>{candidate.status === "In progress" ? "In progress" : new Date(candidate.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span><span><VerdictTone verdict={candidate.verdict} /></span></div></div></div>
-          <div className="flex items-center justify-between gap-4 sm:justify-end"><ScoreRing score={candidate.score} size={48} /><span className="text-[10px] font-semibold text-[#477753] group-hover:underline">View report <ArrowRight className="ml-1 inline" size={12} /></span></div>
+          <div className="flex flex-wrap items-center justify-between gap-3 sm:justify-end">
+            <div className="flex items-center gap-2.5 rounded-xl bg-[#f7faf7] px-2.5 py-2"><ScoreRing score={candidate.score} size={48} /><div><div className="text-[9px] font-medium text-[#8a968e]">Authenticity Score</div><div className="text-[10px] font-semibold text-[#46584b]">{candidate.score}/100</div></div></div>
+            <div className="flex gap-1">{Object.keys(trackLabels).map((track) => <TrackScoreRing key={track} track={track} result={candidate.track_results?.find((result) => result.track === track)} />)}</div>
+            <span className="text-[10px] font-semibold text-[#477753] group-hover:underline">View report <ArrowRight className="ml-1 inline" size={12} /></span>
+          </div>
         </Link>)}
         {!loading && !filtered.length && !error && <div className="px-5 py-12 text-center text-[12px] text-[#8b978f]">No candidates match this search.</div>}
       </section>
@@ -1243,7 +1956,7 @@ function CandidateDetail() {
   return <PageFrame dashboard><main className="mx-auto max-w-[1240px] px-5 pb-12 pt-8 lg:px-8">
     <Link to="/dashboard" className="inline-flex items-center gap-2 text-[11px] font-medium text-[#77847c] hover:text-[#385d44]"><ArrowLeft size={13} /> Candidate dashboard</Link>
     <div className="mt-5 flex flex-col justify-between gap-4 rounded-[20px] border border-[#e6ece7] bg-white p-5 sm:flex-row sm:items-center sm:p-6">
-      <div className="flex items-center gap-4"><span className="grid size-12 place-items-center rounded-full bg-[#edf4ee] text-sm font-semibold text-[#487453]">{candidate.name.split(" ").map((word) => word[0]).join("")}</span><div><div className="flex flex-wrap items-center gap-2.5"><h1 className="text-[22px] font-semibold tracking-[-.04em]">{candidate.name}</h1><VerdictTone verdict={candidate.verdict} /></div><p className="mt-1 text-[11px] text-[#849087]">{candidate.role} <span className="mx-1.5 text-[#c4ccc6]">·</span>{candidate.email || "Email not provided"} <span className="mx-1.5 text-[#c4ccc6]">·</span>{candidate.task_variant || "Skills assessment"}</p></div></div>
+      <div className="flex items-center gap-4"><span className="grid size-12 place-items-center rounded-full bg-[#edf4ee] text-sm font-semibold text-[#487453]">{candidate.name.split(" ").map((word) => word[0]).join("")}</span><div><div className="flex flex-wrap items-center gap-2.5"><h1 className="app-page-title text-[22px] font-semibold tracking-[-.04em]">{candidate.name}</h1><VerdictTone verdict={candidate.verdict} /></div><p className="mt-1 text-[11px] text-[#849087]">{candidate.role} <span className="mx-1.5 text-[#c4ccc6]">·</span>{candidate.email || "Email not provided"} <span className="mx-1.5 text-[#c4ccc6]">·</span>{candidate.task_variant || "Skills assessment"}</p></div></div>
       <div className="flex items-center gap-4"><div className="flex items-center gap-3"><ScoreRing score={candidate.score} size={58} /><div><div className="text-[10px] text-[#8a968e]">Evidence score</div><div className="text-[12px] font-semibold">Weighted across signals</div></div></div>{candidate.credential_id && <button onClick={onCopy} className="inline-flex items-center gap-2 rounded-full border border-[#dce8df] px-3.5 py-2.5 text-[11px] font-semibold text-[#477753] hover:bg-[#f2f8f3]"><Copy size={13} />{copied ? "Copied" : "Copy credential link"}</button>}</div>
     </div>
     <div role="tablist" aria-label="Candidate evidence sections" className="mt-5 flex gap-1 overflow-x-auto rounded-2xl border border-[#e6ece7] bg-white p-1.5">
@@ -1252,6 +1965,30 @@ function CandidateDetail() {
 
     {activeTab === "Overview" && <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,.8fr)]">
       <div className="space-y-4">
+        <EvidenceCard title="Three-track assessment breakdown" icon={ClipboardCheck} aside={<span className="text-[9px] text-[#89958d]">Track results and supporting evidence</span>}>
+          {candidate.track_results?.length ? <div className="space-y-3">{Object.entries(trackLabels).map(([track, label]) => {
+            const result = candidate.track_results?.find((item) => item.track === track);
+            if (!result) return <div key={track} className="rounded-xl border border-dashed border-[#e4eae5] p-3 text-[10px] text-[#89958d]">{label}: no result recorded.</div>;
+            const passed = trackPassed(result);
+            const signalLabels: Record<string, string> = {
+              viva: "Reasoning and explanation",
+              process: "Step-by-step work",
+              aiUsage: "Checking AI help",
+              liveCheck: "Tests and output",
+              timeAndPaste: "Time and pasted work",
+            };
+            return <div key={track} className="rounded-xl border border-[#e7ece8] bg-[#fcfdfb] p-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div><h3 className="text-[11px] font-semibold text-[#46584b]">{label}</h3><p className="mt-0.5 text-[9px] text-[#89958d]">Domain · {domainLabels[result.domain] || result.domain}</p></div>
+                <div className="flex items-center gap-2"><span className="text-[12px] font-semibold tabular-nums text-[#34483a]">{result.score}/100</span><Pill tone={passed ? "green" : result.score < 45 ? "red" : "amber"}>{passed ? "Passed" : "Not passed"}</Pill></div>
+              </div>
+              <div className="mt-3 space-y-2">{Object.entries(result.signals).map(([signal, value]) => <div key={signal} className="rounded-lg bg-white px-3 py-2">
+                <div className="flex items-center justify-between gap-2"><span className="text-[9px] font-semibold text-[#637168]">{signalLabels[signal] || signal}</span><span className="text-[9px] font-semibold tabular-nums text-[#526158]">{value}/100</span></div>
+                <p className="mt-1 text-[9px] leading-4 text-[#89958d]">{trackSignalEvidence(result, signal, candidate)}</p>
+              </div>)}</div>
+            </div>;
+          })}</div> : <p className="text-[10px] text-[#89958d]">No per-track results have been submitted.</p>}
+        </EvidenceCard>
         <EvidenceCard title={`Final verdict: ${candidate.verdict}`} icon={ShieldCheck}>
           <p className="text-[12px] leading-6 text-[#647168]">{verdictReason}</p>
           <div className="mt-4 rounded-xl border border-[#e4ece5] bg-[#f7faf7] p-4"><div className="flex items-center gap-2 text-[11px] font-semibold text-[#4d7657]"><Shield size={14} /> Fairness by design</div><p className="mt-1.5 text-[10px] leading-5 text-[#7c8980]">No candidate is rejected on a single signal. A human reviewer makes the final decision; AI use and AI-text notes are never standalone evidence.</p></div>
@@ -1301,7 +2038,7 @@ function CandidateDetail() {
         <div className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
           {[["Prompts", candidate.ai_prompts.length], ["Verified", verifiedPrompts], ["Seeded mistakes caught", `${caughtMistakes}/${seededMistakes}`], ["Code improved after AI", editedAfterPrompts]].map(([label, value]) => <div key={String(label)} className="rounded-xl bg-[#f7faf7] p-3"><div className="text-[9px] text-[#8b978f]">{label}</div><div className="mt-1 text-[14px] font-semibold text-[#46584b]">{value}</div></div>)}
         </div>
-        {candidate.ai_prompts.length ? <div className="space-y-3">{candidate.ai_prompts.map((item, index) => <div key={item.id || index} className="rounded-xl border border-[#eceaf4] bg-[#fcfbff] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8e879e]">Prompt {index + 1}</div><p className="mt-1.5 text-[11px] leading-5 text-[#615d77]">“{item.prompt}”</p>{item.response && <p className="mt-2 rounded-lg bg-white p-3 text-[10px] leading-5 text-[#727083]"><strong>Assistant response:</strong> {item.response}</p>}<div className="mt-3 flex flex-wrap gap-2 text-[9px] font-medium"><Pill tone={item.verified ? "green" : "gray"}>{item.verified ? "Verified by candidate" : "Not marked verified"}</Pill>{item.seeded_mistake && <Pill tone={item.caught || item.edited_after ? "green" : "amber"}>{item.caught || item.edited_after ? "Seeded mistake caught" : "Seeded mistake not caught"}</Pill>}</div><p className="mt-2 text-[10px] leading-4 text-[#8a9190]">{item.summary}</p></div>)}</div> : <p className="text-[11px] text-[#89958d]">No assistant prompts recorded.</p>}
+        {candidate.ai_prompts.length ? <div className="space-y-3">{candidate.ai_prompts.map((item, index) => <div key={item.id || index} className="rounded-xl border border-[#eceaf4] bg-[#fcfbff] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8e879e]">Prompt {index + 1}</div><p className="mt-1.5 text-[11px] leading-5 text-[#615d77]">“{item.prompt}”</p>{item.response && <p className="mt-2 rounded-lg bg-white p-3 text-[10px] leading-5 text-[#727083]"><strong>Assistant response:</strong> {item.response}</p>}<div className="mt-3 flex flex-wrap gap-2 text-[9px] font-medium"><Pill tone={item.verified ? "green" : "gray"} verified={item.verified}>{item.verified ? "Verified by candidate" : "Not marked verified"}</Pill>{item.seeded_mistake && <Pill tone={item.caught || item.edited_after ? "green" : "amber"}>{item.caught || item.edited_after ? "Seeded mistake caught" : "Seeded mistake not caught"}</Pill>}</div><p className="mt-2 text-[10px] leading-4 text-[#8a9190]">{item.summary}</p></div>)}</div> : <p className="text-[11px] text-[#89958d]">No assistant prompts recorded.</p>}
       </EvidenceCard>
       <EvidenceCard title="AI-text style note" icon={CircleHelp}>
         <p className="rounded-xl border border-[#e7e2d6] bg-[#fbf9f2] p-4 text-[11px] leading-6 text-[#786e59]"><strong>Weak signal, not used alone.</strong> {candidate.ai_text_note || "Response-length style observations may have false positives, including for non-native English speakers, and contribute 0% to the score."}</p>
@@ -1323,7 +2060,12 @@ function CandidateDetail() {
 
     {activeTab === "Credential" && <div className="mt-4">
       <EvidenceCard title="Credential" icon={BadgeCheck}>
-        {candidate.credential_id && candidate.verdict === "Verified skill" ? <div className="flex flex-col justify-between gap-4 rounded-2xl border border-[#dce9df] bg-[#f8fbf8] p-5 sm:flex-row sm:items-center"><div><Pill><BadgeCheck size={11} /> Verified skill</Pill><h2 className="mt-3 text-[18px] font-semibold">{candidate.name}</h2><p className="mt-1 text-[11px] text-[#78847c]">Skills: Code reasoning · Edge-case handling</p><p className="mt-1 font-mono text-[10px] text-[#89958d]">{candidate.credential_id}</p><Link to={`/credential/${candidate.id}`} className="mt-4 inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Open credential card <ExternalLink size={11} /></Link></div><CheckCircle2 className="text-[#4d8a5d]" size={28} /></div> : <div className="rounded-xl border border-[#ece7dc] bg-[#fbf8f1] p-4 text-[11px] leading-5 text-[#8a754f]">A public credential is issued only when the assessment reaches Verified skill. This candidate currently has no credential.</div>}
+        {candidate.credential_id && candidate.verdict === "Verified skill" ? <div className="rounded-2xl border border-[#dce9df] bg-[#f8fbf8] p-5">
+          <div className="flex items-start justify-between gap-4"><div><Pill verified><BadgeCheck size={11} /> Verified skill</Pill><h2 className="mt-3 text-[18px] font-semibold">{candidate.name}</h2><p className="mt-1 text-[11px] text-[#78847c]">Domain: {[...new Set(passedTrackResults(candidate).map((result) => domainLabels[result.domain] || result.domain))].join(", ") || domainLabels[candidate.domain || ""] || "Not recorded"}</p><p className="mt-1 font-mono text-[10px] text-[#89958d]">{candidate.credential_id}</p></div><CheckCircle2 className="shrink-0 text-[#4d8a5d]" size={28} /></div>
+          <div className="mt-4 flex flex-wrap gap-2">{passedTrackResults(candidate).map((result) => <Pill key={result.track} verified><CheckCircle2 size={10} />{trackLabels[result.track] || result.track}</Pill>)}</div>
+          <p className="mt-3 text-[10px] leading-5 text-[#78847c]">Issued {new Date(candidate.created_at).toLocaleDateString()}. {candidate.verdict_reason || "Verified through track evidence and human review."}</p>
+          <Link to={`/credential/${candidate.id}`} className="mt-4 inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Open credential card <ExternalLink size={11} /></Link>
+        </div> : <div className="rounded-xl border border-[#ece7dc] bg-[#fbf8f1] p-4 text-[11px] leading-5 text-[#8a754f]">A public credential is issued only when the assessment reaches Verified skill. This candidate currently has no credential.</div>}
       </EvidenceCard>
       <EvidenceCard title="Submitted solution" icon={Code2}><pre className="scrollbar-thin overflow-auto rounded-xl bg-[#111b18] p-4 font-mono text-[11px] leading-6 text-[#c0d0c4]">{candidate.code}</pre></EvidenceCard>
     </div>}
@@ -1335,6 +2077,7 @@ function Verification() {
   const queryCredentialId = searchParams.get("credentialId") || "";
   const [credentialId, setCredentialId] = useState(queryCredentialId);
   const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [credential, setCredential] = useState<Awaited<ReturnType<typeof api.credential>>["credential"] | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
 
@@ -1344,8 +2087,15 @@ function Verification() {
     try {
       const result = await api.verifyCredential(value);
       setCandidate(result);
+      if (result.credential_id) {
+        const credentialResult = await api.credential(result.credential_id);
+        setCredential(credentialResult.credential);
+      } else {
+        setCredential(null);
+      }
     } catch (issue) {
       setCandidate(null);
+      setCredential(null);
       setError(issue instanceof Error ? issue.message : "Credential not found.");
     } finally {
       setLoading(false);
@@ -1372,7 +2122,7 @@ function Verification() {
     <div className="rounded-[28px] border border-[#e6ece7] bg-white p-6 shadow-[0_18px_60px_#17321b10] sm:p-9">
       <div className="flex items-center justify-between gap-3"><div>
         <Pill><ShieldCheck size={11} /> Public verification</Pill>
-        <h1 className="mt-4 text-[30px] font-semibold tracking-[-.05em]">Verify a SkillProof credential</h1>
+        <h1 className="app-page-title mt-4 text-[30px] font-semibold tracking-[-.05em]">Verify a SkillProof credential</h1>
       </div><span className="grid size-11 place-items-center rounded-2xl bg-[#edf4ef] text-[#4d835d]"><BadgeCheck size={19} /></span></div>
       <p className="mt-3 max-w-[620px] text-[13px] leading-6 text-[#758078]">Enter a credential ID to confirm whether the candidate has a verified SkillProof assessment on file.</p>
       <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-3 sm:flex-row">
@@ -1386,13 +2136,19 @@ function Verification() {
             <div className="text-[10px] font-semibold uppercase tracking-[.14em] text-[#7a8d82]">Verified record</div>
             <h2 className="mt-2 text-[22px] font-semibold tracking-[-.04em] text-[#1d3327]">{candidate.name}</h2>
           </div>
-          <Pill tone="green"><BadgeCheck size={10} /> Verified skill</Pill>
+          <Pill verified><BadgeCheck size={10} /> Verified skill</Pill>
         </div>
         <div className="mt-4 grid gap-3 sm:grid-cols-3">
-          {[['Credential ID', candidate.credential_id || '—'], ['Score', `${candidate.score}/100`], ['Role', candidate.role]].map(([label, value]) => <div key={label} className="rounded-xl bg-white p-3"><div className="text-[9px] uppercase tracking-[.12em] text-[#8c9990]">{label}</div><div className="mt-1 text-[12px] font-semibold text-[#2d4138]">{value}</div></div>)}
+          {[['Credential ID', credential?.credential_id || candidate.credential_id || '—'], ['Date issued', credential ? new Date(credential.issued_date).toLocaleDateString() : new Date(candidate.created_at).toLocaleDateString()], ['Domain verified', [...new Set(passedTrackResults(candidate).map((result) => domainLabels[result.domain] || result.domain))].join(", ") || domainLabels[candidate.domain || ""] || "Not recorded"], ['Authenticity Score', `${candidate.score}/100`], ['Role', candidate.role]].map(([label, value]) => <div key={label} className="rounded-xl bg-white p-3"><div className="text-[9px] uppercase tracking-[.12em] text-[#8c9990]">{label}</div><div className="mt-1 text-[12px] font-semibold text-[#2d4138]">{value}</div></div>)}
+        </div>
+        <div className="mt-4 rounded-xl border border-[#e3eae4] bg-white p-3.5">
+          <div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8c9990]">Tracks passed</div>
+          <div className="mt-2 flex flex-wrap gap-2">{passedTrackResults(candidate).length
+            ? passedTrackResults(candidate).map((result) => <Pill key={result.track} verified><CheckCircle2 size={10} />{trackLabels[result.track] || result.track}</Pill>)
+            : <span className="text-[10px] text-[#7d8981]">Track results are not available for this record.</span>}</div>
         </div>
         <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#e3eae4] bg-white p-3.5">
-          <div className="text-[11px] text-[#74827b]">Assessment published on {new Date(candidate.created_at).toLocaleDateString()}</div>
+          <div className="text-[11px] text-[#74827b]">{credential?.evidence_summary || "Evidence was reviewed across the recorded assessment."}</div>
           <Link to={`/credential/${candidate.id}`} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-3 py-2 text-[10px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">View public credential <ExternalLink size={11} /></Link>
         </div>
       </div>}
@@ -1420,6 +2176,8 @@ function Credential() {
   }, [id]);
   const credentialUrl = `${window.location.origin}/credential/${id}`;
   const verifyUrl = credential ? `${window.location.origin}/verify?credentialId=${encodeURIComponent(credential.credential_id)}` : "";
+  const passedTracks = candidate ? passedTrackResults(candidate) : [];
+  const verifiedDomains = [...new Set(passedTracks.map((result) => domainLabels[result.domain] || result.domain))];
   async function copy() {
     try { await navigator.clipboard.writeText(credentialUrl); setCopied(true); window.setTimeout(() => setCopied(false), 1500); }
     catch { setError("Could not copy this link. Copy the page URL from your browser."); }
@@ -1439,13 +2197,25 @@ function Credential() {
   }
   return <PageFrame><main className="mx-auto max-w-[760px] px-5 py-14 sm:py-20">
     <div className="flex justify-center"><Logo /></div>
-    {error ? <div role="alert" className="mt-10 rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</div> : !loaded ? <p className="mt-12 text-center text-sm text-[#859188]">Verifying credential…</p> : !candidate?.credential_id || candidate.verdict !== "Verified skill" || !credential ? <div className="mt-10 rounded-2xl border border-[#e6ece7] bg-white p-8 text-center"><CircleHelp className="mx-auto text-[#ad8746]" /><h1 className="mt-3 text-xl font-semibold">Credential unavailable</h1><p className="mt-2 text-sm text-[#7c8980]">This assessment has not earned a verified credential.</p></div> : <div className="relative mt-10 overflow-hidden rounded-[28px] border border-[#dce9df] bg-white shadow-[0_20px_70px_#17321b12]">
+    {error ? <div role="alert" className="mt-10 rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</div> : !loaded ? <p className="mt-12 text-center text-sm text-[#859188]">Verifying credential…</p> : !candidate?.credential_id || candidate.verdict !== "Verified skill" || !credential ? <div className="mt-10 rounded-2xl border border-[#e6ece7] bg-white p-8 text-center"><CircleHelp className="mx-auto text-[#ad8746]" /><h1 className="app-page-title mt-3 text-xl font-semibold">Credential unavailable</h1><p className="mt-2 text-sm text-[#7c8980]">This assessment has not earned a verified credential.</p></div> : <div className="relative mt-10 overflow-hidden rounded-[28px] border border-[#dce9df] bg-white shadow-[0_20px_70px_#17321b12]">
       <div className="absolute right-0 top-0 size-64 translate-x-20 -translate-y-20 rounded-full bg-[radial-gradient(circle,#e2f2e5_0%,transparent_70%)]" />
       <div className="relative border-b border-[#eef2ee] px-7 py-6 sm:px-10"><div className="flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[.16em] text-[#77917d]">SkillProof credential</span><span className="grid size-10 place-items-center rounded-xl bg-[#eaf5ed] text-[#4d865b]"><BadgeCheck size={20} /></span></div></div>
-      <div className="relative px-7 py-8 sm:px-10 sm:py-10"><Pill><CheckCircle2 size={12} /> Verified skill</Pill><h1 className="mt-5 text-[32px] font-semibold tracking-[-.05em] sm:text-[40px]">{candidate.name}</h1><p className="mt-2 text-[14px] text-[#708077]">demonstrated understanding in a SkillProof assessment</p>
-        <div className="mt-8 grid gap-3 sm:grid-cols-3">{[["Skills verified", credential.skills.join(", ")], ["Issued", new Date(credential.issued_date).toLocaleDateString()], ["Assessment score", `${candidate.score} / 100`]].map(([label, value]) => <div key={label} className="rounded-xl bg-[#f7faf7] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8b9b8e]">{label}</div><div className="mt-1.5 text-[12px] font-semibold text-[#3d5043]">{value}</div></div>)}</div>
-        <div className="mt-6 flex flex-col gap-5 rounded-xl border border-[#e7eee8] p-4 sm:flex-row sm:items-center"><div className="shrink-0 rounded-lg bg-white p-2"><QRCodeSVG value={verifyUrl} size={132} level="M" title="Scan to verify this SkillProof credential" /></div><div><h2 className="text-[12px] font-semibold text-[#435349]">Verify this credential</h2><p className="mt-1 text-[10px] leading-5 text-[#78867d]">Scan the QR code or use the public verification page to confirm this credential ID.</p><p className="mt-3 font-mono text-[10px] text-[#718078]">ID: {credential.credential_id}</p><p className="mt-2 text-[10px] leading-5 text-[#78867d]">{credential.evidence_summary}</p></div></div>
-        <div className="mt-6 flex items-start gap-3 rounded-xl border border-[#e7eee8] p-4"><ShieldCheck size={16} className="mt-0.5 shrink-0 text-[#5a9367]" /><p className="text-[10px] leading-5 text-[#78867d]">Verified through a practical task, candidate-consented process evidence, and a viva about their own work. This credential confirms assessment participation and demonstrated understanding; it is not a guarantee of job performance.</p></div>
+      <div className="relative px-7 py-8 sm:px-10 sm:py-10"><Pill verified><CheckCircle2 size={12} /> Verified skill</Pill><h1 className="app-page-title mt-5 text-[32px] font-semibold tracking-[-.05em] sm:text-[40px]">{candidate.name}</h1><p className="mt-2 text-[14px] text-[#708077]">demonstrated understanding in a SkillProof assessment</p>
+        <div className="mt-8 grid gap-3 sm:grid-cols-2">{[
+          ["Domain verified", verifiedDomains.join(", ") || domainLabels[candidate.domain || ""] || "Not recorded"],
+          ["Date issued", new Date(credential.issued_date).toLocaleDateString()],
+          ["Credential ID", credential.credential_id],
+          ["Authenticity Score", `${candidate.score} / 100`],
+        ].map(([label, value]) => <div key={label} className="rounded-xl bg-[#f7faf7] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8b9b8e]">{label}</div><div className="mt-1.5 break-words text-[12px] font-semibold text-[#3d5043]">{value}</div></div>)}</div>
+        <div className="mt-5 rounded-xl border border-[#e7eee8] bg-[#fbfdfb] p-4">
+          <div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8b9b8e]">Tracks passed</div>
+          <div className="mt-2 flex flex-wrap gap-2">{passedTracks.length
+            ? passedTracks.map((result) => <Pill key={result.track} verified><CheckCircle2 size={10} />{trackLabels[result.track] || result.track}</Pill>)
+            : <span className="text-[10px] text-[#78867d]">Track-level evidence is not available for this credential.</span>}</div>
+          <p className="mt-3 text-[10px] leading-5 text-[#78867d]">{credential.evidence_summary}</p>
+        </div>
+        <div className="mt-6 flex flex-col gap-5 rounded-xl border border-[#e7eee8] p-4 sm:flex-row sm:items-center"><div className="qr-code-panel shrink-0 rounded-lg bg-white p-2"><QRCodeSVG value={verifyUrl} size={132} level="M" title="Scan to verify this SkillProof credential" /></div><div><h2 className="text-[12px] font-semibold text-[#435349]">Verify this credential</h2><p className="mt-1 text-[10px] leading-5 text-[#78867d]">Scan the QR code or use the public verification page to confirm this credential ID.</p><p className="mt-3 text-[10px] text-[#78867d]">Skills: {credential.skills.join(", ")}</p></div></div>
+        <div className="mt-6 flex items-start gap-3 rounded-xl border border-[#e7eee8] p-4"><ShieldCheck size={16} className="mt-0.5 shrink-0 text-[#5a9367]" /><p className="text-[10px] leading-5 text-[#78867d]">This credential summarizes passed track evidence and verified domains. It documents assessment performance; it is not a guarantee of job performance.</p></div>
         <div className="mt-7 flex flex-wrap items-center justify-between gap-3"><Link to={`/verify?credentialId=${encodeURIComponent(credential.credential_id)}`} className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Verify this credential <ExternalLink size={11} /></Link><div className="flex gap-2"><button onClick={copy} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-4 py-2.5 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]"><Copy size={13} />{copied ? "Copied" : "Copy link"}</button><button onClick={share} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d]">{shared ? <Check size={13} /> : <ExternalLink size={13} />}{shared ? "Shared" : "Share"}</button></div></div>
       </div>
     </div>}
@@ -1456,6 +2226,33 @@ function Credential() {
 export default function App() {
   const location = useLocation();
   const [settledLocationKey, setSettledLocationKey] = useState<string | null>(null);
+  const [journey, setJourney] = useState<AssessmentJourney>(emptyAssessmentJourney);
+  const startSingle = useCallback((track: AssessmentTrack) => {
+    setJourney({ tracks: [track], currentIndex: 0, profile: null, active: true });
+  }, []);
+  const startFull = useCallback(() => {
+    setJourney({ tracks: ["problem-solver", "skill", "adapt"], currentIndex: 0, profile: null, active: true });
+  }, []);
+  const rememberProfile = useCallback((profile: AssessmentProfile) => {
+    setJourney((current) => ({ ...current, profile }));
+  }, []);
+  const advance = useCallback(() => {
+    const nextIndex = journey.currentIndex + 1;
+    if (nextIndex >= journey.tracks.length) {
+      setJourney(emptyAssessmentJourney);
+      return null;
+    }
+    const nextTrack = journey.tracks[nextIndex];
+    setJourney((current) => ({ ...current, currentIndex: nextIndex }));
+    return nextTrack;
+  }, [journey.currentIndex, journey.tracks]);
+  const assessmentFlow = useMemo(() => ({
+    journey,
+    startSingle,
+    startFull,
+    rememberProfile,
+    advance,
+  }), [advance, journey, rememberProfile, startFull, startSingle]);
 
   useEffect(() => {
     const timer = window.setTimeout(() => setSettledLocationKey(location.key), 1500);
@@ -1472,17 +2269,25 @@ export default function App() {
         exit={{ opacity: 0, y: -3 }}
         transition={{ duration: 0.18, ease: "easeOut" }}
       >
-        <Routes location={location}>
-          <Route path="/" element={<Home />} />
-          <Route path="/assessment" element={<Assessment />} />
-          <Route path="/viva/:id" element={<Viva />} />
-          <Route path="/live-check/:id" element={<LiveCheckChallenge />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/verify" element={<Verification />} />
-          <Route path="/candidates/:id" element={<CandidateDetail />} />
-          <Route path="/credential/:id" element={<Credential />} />
-          <Route path="*" element={<Navigate to="/" replace />} />
-        </Routes>
+        <AssessmentFlowContext.Provider value={assessmentFlow}>
+          <Routes location={location}>
+            <Route path="/" element={<Home />} />
+            <Route path="/assessments" element={<AssessmentHub />} />
+            <Route path="/assessments/full" element={<FullAssessmentRoute />} />
+            <Route path="/assessments/result/:id" element={<TrackResultScreen />} />
+            <Route path="/assessments/:track" element={<AssessmentTrackRoute />} />
+            <Route path="/assessment" element={<Navigate to="/assessments" replace />} />
+            <Route path="/assessment/*" element={<Navigate to="/assessments" replace />} />
+            <Route path="/viva/:id" element={<Viva />} />
+            <Route path="/live-check/:id" element={<LiveCheckChallenge />} />
+            <Route path="/hr" element={<Dashboard />} />
+            <Route path="/dashboard" element={<Navigate to="/hr" replace />} />
+            <Route path="/verify" element={<Verification />} />
+            <Route path="/candidates/:id" element={<CandidateDetail />} />
+            <Route path="/credential/:id" element={<Credential />} />
+            <Route path="*" element={<Navigate to="/" replace />} />
+          </Routes>
+        </AssessmentFlowContext.Provider>
       </motion.div>
     </AnimatePresence>
     <AnimatePresence>

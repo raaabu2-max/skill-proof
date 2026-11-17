@@ -43,9 +43,51 @@ export type TaskVariant = {
   id: string;
   title: string;
   description: string;
-  field: string;
-  dataset: Record<string, unknown>[];
-  thresholds: { minEditEvents: number; maxPasteCharacters: number };
+  field?: string;
+  taskId?: string;
+  taskTitle?: string;
+  starter?: string;
+  dataset?: Record<string, unknown>[];
+  thresholds?: { minEditEvents: number; maxPasteCharacters: number };
+  failingTests?: string[];
+  requirementChange?: string;
+};
+
+export type TrackDomain = {
+  id: string;
+  title: string;
+  kind: "coding" | "practical";
+};
+
+export type TrackDefinition = {
+  id: "problem-solver" | "skill" | "adapt";
+  title: string;
+  description: string;
+  domains: string[];
+  tasks: {
+    id: string;
+    domain: string;
+    title: string;
+    description: string;
+    variants: TaskVariant[];
+  }[];
+};
+
+export type TracksCatalog = {
+  version: number;
+  trackWeights: Record<string, number>;
+  domains: Record<string, TrackDomain>;
+  tracks: Record<TrackDefinition["id"], TrackDefinition>;
+};
+
+export type TrackResult = {
+  track: string;
+  domain: string;
+  task_variant: string;
+  score: number;
+  signals: Record<string, number>;
+  evidence: Record<string, unknown>;
+  submitted_at: string;
 };
 
 export type FlagDetail = {
@@ -73,6 +115,10 @@ export type CredentialDetails = {
 
 export type Candidate = {
   id: string;
+  session_id?: string | null;
+  track?: "problem-solver" | "skill" | "adapt";
+  domain?: string;
+  track_results?: TrackResult[];
   name: string;
   role: string;
   email: string;
