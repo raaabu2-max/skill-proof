@@ -1,0 +1,1128 @@
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ComponentProps, FormEvent, ReactNode } from "react";
+import Editor from "@monaco-editor/react";
+import { QRCodeSVG } from "qrcode.react";
+import {
+  ArrowDownRight, ArrowLeft, ArrowRight, BadgeCheck, BarChart3, BrainCircuit, Check,
+  CheckCircle2, ChevronRight, CircleHelp, ClipboardCheck, Clock3, Code2, Copy, ExternalLink,
+  Eye, FileCode2, Flag, KeyRound, LayoutDashboard, Lightbulb, LockKeyhole, MessageSquareText, Plus,
+  Radio, Shield, ShieldCheck, Sparkles, Upload, Users, WandSparkles, X,
+} from "lucide-react";
+import { Link, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { api } from "./lib/api";
+import type { Candidate, TaskVariant, TimelineEvent, VivaAnswer } from "./types";
+
+const ActivityChart = lazy(() => import("./ActivityChart"));
+
+const starterCode = `function groupBy(items, key) {
+  // Return an object whose values are arrays of matching items.
+  return items.reduce((groups, item) => {
+    const value = item[key];
+    (groups[value] ??= []).push(item);
+    return groups;
+  }, {});
+}`;
+
+function Logo({ small = false }: { small?: boolean }) {
+  return <Link to="/" className="brand-link flex items-center gap-2.5 font-semibold tracking-tight">
+    <span className="brand-mark grid size-9 place-items-center rounded-xl"><ShieldCheck size={19} strokeWidth={2.2} /></span>
+    {!small && <span className="text-[17px]">skillproof<span className="brand-period">.</span></span>}
+  </Link>;
+}
+
+function TopNav({ dashboard = false }: { dashboard?: boolean }) {
+  return <header className="top-nav sticky top-0 z-30 border-b backdrop-blur-xl">
+    <div className="mx-auto flex h-[68px] max-w-[1240px] items-center justify-between px-5 lg:px-8">
+      <Logo />
+      {dashboard ? <nav className="hidden items-center gap-1 sm:flex">
+        <Link to="/dashboard" className="nav-active flex items-center gap-2 rounded-lg px-3.5 py-2 text-sm font-medium"><LayoutDashboard size={16} /> Dashboard</Link>
+        <Link to="/verify" className="rounded-lg px-3.5 py-2 text-sm transition">Verify credential</Link>
+        <Link to="/" className="rounded-lg px-3.5 py-2 text-sm transition">Candidate experience</Link>
+      </nav> : <nav className="hidden items-center gap-7 text-[13px] md:flex">
+        <a href="#features" className="transition">Features</a>
+        <a href="#how-it-works" className="transition">How it works</a>
+        <a href="#principles" className="transition">Our principles</a>
+        <Link to="/dashboard" className="transition">For hiring teams</Link>
+        <Link to="/verify" className="transition">Verify credential</Link>
+      </nav>}
+      <div className="flex items-center gap-3">
+        <Link to="/dashboard" className="nav-signin hidden text-[13px] font-medium sm:inline">Sign in</Link>
+        <Link to="/assessment" className="nav-cta inline-flex items-center gap-2 rounded-full px-4 py-2.5 text-[13px] font-semibold text-white transition">
+          Try the demo <ArrowRight size={14} />
+        </Link>
+      </div>
+    </div>
+    <nav aria-label="Mobile navigation" className={`mobile-nav mx-auto flex max-w-[1240px] gap-5 overflow-x-auto px-5 pb-3 text-xs lg:px-8 ${dashboard ? "sm:hidden" : "md:hidden"}`}>
+      {dashboard ? <>
+        <Link to="/dashboard" className="shrink-0 font-medium">Dashboard</Link>
+        <Link to="/verify" className="shrink-0">Verify credential</Link>
+        <Link to="/" className="shrink-0">Candidate experience</Link>
+      </> : <>
+        <a href="#features" className="shrink-0">Features</a>
+        <a href="#how-it-works" className="shrink-0">How it works</a>
+        <Link to="/dashboard" className="shrink-0">For hiring teams</Link>
+        <Link to="/verify" className="shrink-0">Verify credential</Link>
+      </>}
+    </nav>
+  </header>;
+}
+
+function summarizePrompt(prompt: string) {
+  const text = prompt.toLowerCase();
+  if (/\b(write|generate|solve|complete solution|give me (the )?(code|solution))\b/.test(text)) {
+    return "Direct solution request; review the viva and replay to understand how the candidate evaluated the suggestion.";
+  }
+  if (/\b(explain|why|how|compare|tradeoff|edge case|complexity|review|verify|check)\b/.test(text)) {
+    return "Asked for an explanation, comparison, or verification rather than a complete solution.";
+  }
+  return "Prompt content is available as context for the reviewer.";
+}
+
+function LoadingScreen() {
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    const interval = window.setInterval(() => {
+      setProgress((current) => (current >= 100 ? 100 : current + 8));
+    }, 120);
+
+    const timeout = window.setTimeout(() => {
+      window.clearInterval(interval);
+      setProgress(100);
+    }, 1500);
+
+    return () => {
+      window.clearInterval(interval);
+      window.clearTimeout(timeout);
+    };
+  }, []);
+
+  return <div className="loading-screen" aria-live="polite" aria-busy="true">
+    <div className="loading-scene" aria-hidden="true">
+      <div className="loading-cube">
+        <span className="cube-face cube-front" />
+        <span className="cube-face cube-back" />
+        <span className="cube-face cube-right" />
+        <span className="cube-face cube-left" />
+        <span className="cube-face cube-top" />
+        <span className="cube-face cube-bottom" />
+      </div>
+    </div>
+    <div className="loading-brand">skillproof<span>.</span></div>
+    <p className="loading-copy">Loading evidence…</p>
+    <div className="loading-bar" aria-hidden="true">
+      <span style={{ width: `${progress}%` }} />
+    </div>
+  </div>;
+}
+
+function Home() {
+  const steps = [
+    { number: "01", icon: ClipboardCheck, title: "A real task", text: "Candidates work on the same practical challenge in a focused workspace.", color: "mint" },
+    { number: "02", icon: Radio, title: "Process, not just output", text: "With consent, see how an idea takes shape through edits and decisions.", color: "pink" },
+    { number: "03", icon: MessageSquareText, title: "A thoughtful viva", text: "Candidates explain their choices and edge cases in their own words.", color: "yellow" },
+    { number: "04", icon: BadgeCheck, title: "Evidence you can trust", text: "Review a balanced report and share a verified credential.", color: "blue" },
+  ];
+  const evidence = [
+    { icon: Radio, title: "Process replay", text: "A clear timeline of edits, pastes, timing, and focus changes.", accent: "mint" },
+    { icon: MessageSquareText, title: "AI viva", text: "A short conversation about decisions, trade-offs, and edge cases.", accent: "pink" },
+    { icon: Sparkles, title: "AI, in context", text: "Prompts add context; thoughtful checking matters more than avoidance.", accent: "yellow" },
+    { icon: WandSparkles, title: "Adaptability", text: "A changed requirement shows how candidates respond to new constraints.", accent: "blue" },
+    { icon: Code2, title: "Live skill check", text: "A timed debugging follow-up with transparent test results.", accent: "pink" },
+    { icon: Shield, title: "Responsible analysis", text: "Text-style observations are weak context and add zero score points.", accent: "mint" },
+  ];
+  return <div className="landing-page min-h-screen">
+    <TopNav />
+    <main>
+      <section className="landing-hero">
+        <div className="landing-hero-inner">
+          <div className="hero-copy animate-rise">
+            <div className="hero-eyebrow"><span /> THE HUMAN SIDE OF TECH HIRING</div>
+            <h1>See the thinking.<br />Meet the <span>real talent.</span></h1>
+            <p>Great hiring is more than a perfect answer. SkillProof brings the process, reasoning, and practical skill into one clear picture — with AI treated as a tool, not a verdict.</p>
+            <div className="hero-actions">
+              <Link to="/assessment" className="hero-primary">Try the live demo <ArrowRight size={16} /></Link>
+              <a href="#how-it-works" className="hero-secondary">Explore the platform <ArrowDownRight size={16} /></a>
+            </div>
+            <div className="hero-trust">
+              <div className="avatar-stack"><span>M</span><span>L</span><span>A</span><span>+</span></div>
+              <div><strong>Better signal, fairer hiring</strong><small>Designed for real people, not perfect prompts.</small></div>
+            </div>
+          </div>
+          <div className="hero-visual animate-rise">
+            <div className="visual-orbit orbit-pink" />
+            <div className="visual-orbit orbit-teal" />
+            <div className="floating-note note-process"><span className="live-dot" /><div><strong>Process replay</strong><small>Thoughtful edits · 18 min</small></div><Radio size={17} /></div>
+            <div className="product-window">
+              <div className="window-topbar"><div className="window-dots"><i /><i /><i /></div><span>SKILLPROOF / CANDIDATE WORKSPACE</span><span className="window-secure"><ShieldCheck size={12} /> PRIVATE</span></div>
+              <div className="product-content">
+                <div className="product-sidebar"><span className="sidebar-mark"><ShieldCheck size={17} /></span><span className="sidebar-active"><Code2 size={15} /></span><span><Radio size={15} /></span><span><MessageSquareText size={15} /></span><span><BadgeCheck size={15} /></span></div>
+                <div className="product-main">
+                  <div className="product-heading"><div><span className="product-kicker">ASSESSMENT · TASK 01</span><h3>Group items by key</h3></div><span className="task-status"><i /> IN PROGRESS</span></div>
+                  <div className="code-preview">
+                    <div className="code-tabs"><span>solution.js</span><span>⌘</span></div>
+                    <pre><span className="code-muted">01</span> <span className="code-purple">function</span> groupBy(items, key) {"{"}{"\n"}<span className="code-muted">02</span>   <span className="code-purple">return</span> items.<span className="code-yellow">reduce</span>((groups, item) =&gt; {"{"}{"\n"}<span className="code-muted">03</span>     <span className="code-purple">const</span> value = item[key];{"\n"}<span className="code-muted">04</span>     (groups[value] ??= []).<span className="code-yellow">push</span>(item);{"\n"}<span className="code-muted">05</span>     <span className="code-purple">return</span> groups;{"\n"}<span className="code-muted">06</span>   {"}"}, {"{}"});{"\n"}<span className="code-muted">07</span> {"}"}</pre>
+                  </div>
+                  <div className="product-foot"><span><Eye size={13} /> Candidate-consented process</span><span>00:18:42</span></div>
+                </div>
+              </div>
+              <div className="product-bottom"><span>ASSESSMENT SIGNALS</span><div><i className="signal-green" /><i className="signal-pink" /><i className="signal-yellow" /><i className="signal-blue" /></div><strong>4 signals in context</strong></div>
+            </div>
+            <div className="floating-note note-score"><span className="score-orb"><Sparkles size={16} /></span><div><small>Understanding score</small><strong>92 <em>/ 100</em></strong></div><span className="score-trend">+12%</span></div>
+            <div className="visual-caption"><span>01</span> A clearer view of real skill <i /></div>
+          </div>
+        </div>
+      </section>
+      <section className="brand-strip" aria-label="SkillProof principles">
+        <div><span>BUILT FOR BETTER HIRING</span><strong>Human-first</strong><i /> <strong>Evidence-led</strong><i /> <strong>AI-aware</strong><i /> <strong>Fair by design</strong></div>
+      </section>
+
+      <section id="how-it-works" className="how-section">
+        <div className="section-heading">
+          <div><span className="section-kicker">FROM FIRST LINE TO FULL PICTURE</span><h2>A better way to<br /><span>see what people can do.</span></h2></div>
+          <p>One polished answer can’t tell the whole story. We bring together practical work, real reasoning, and human review.</p>
+        </div>
+        <div className="steps-grid">{steps.map(({ number, icon: Icon, title, text, color }) => <article key={number} className={`step-card accent-${color}`}>
+          <div className="step-card-top"><span className="step-icon"><Icon size={19} /></span><span>{number}</span></div>
+          <h3>{title}</h3><p>{text}</p><div className="step-decoration" />
+        </article>)}</div>
+      </section>
+
+      <section id="features" className="evidence-section">
+        <div className="evidence-heading"><span className="section-kicker">THE WHOLE STORY, NOT JUST THE SUBMISSION</span><h2>Six signals.<br /><span>One human decision.</span></h2><p>Each signal adds context. None is treated as proof of authorship or a standalone hiring decision.</p></div>
+        <div className="evidence-grid">{evidence.map(({ icon: Icon, title, text, accent }, index) => <article key={title} className={`evidence-card accent-${accent}`}>
+          <span className="evidence-icon"><Icon size={17} /></span><span className="evidence-index">0{index + 1}</span><h3>{title}</h3><p>{text}</p><ArrowRight className="evidence-arrow" size={16} />
+        </article>)}</div>
+        <div className="fairness-note"><span className="fairness-icon"><ShieldCheck size={18} /></span><p><strong>AI use is context, not a verdict.</strong> We never reject candidates based on AI activity alone. Review the evidence, then make a fair, informed decision.</p><Link to="/dashboard">How we keep it fair <ArrowRight size={14} /></Link></div>
+      </section>
+
+      <section id="principles" className="principles-section">
+        <div className="principles-copy"><span className="section-kicker">DESIGNED AROUND PEOPLE</span><h2>Make room for<br /><span>the human part.</span></h2><p>Candidates deserve a chance to show how they think. Hiring teams deserve evidence they can actually discuss.</p><Link to="/dashboard" className="principles-link">Explore the hiring workspace <ArrowRight size={15} /></Link></div>
+        <div className="principles-card">
+          <div className="principles-card-head"><span className="principles-emblem"><Users size={18} /></span><div><strong>Fairness, built in</strong><small>A more thoughtful candidate experience</small></div><span className="principles-live">LIVE</span></div>
+          <div className="fair-step"><span>01</span><div><strong>Clear from the start</strong><small>Candidates know what is collected and why.</small></div><BadgeCheck size={18} /></div>
+          <div className="fair-step"><span>02</span><div><strong>AI is never the judge</strong><small>Human review stays at the center.</small></div><ShieldCheck size={18} /></div>
+          <div className="fair-step"><span>03</span><div><strong>Evidence, not surveillance</strong><small>No camera, microphone, or browsing history.</small></div><Eye size={18} /></div>
+          <div className="principles-card-foot"><span><i /> TRUST BY DESIGN</span><span>SKILLPROOF · 2026</span></div>
+        </div>
+      </section>
+    </main>
+    <footer className="landing-footer"><div><Logo /><span>Clear evidence. Fairer conversations. Better hiring.</span><span>© {new Date().getFullYear()} SkillProof</span></div></footer>
+  </div>;
+}
+
+function PageFrame({ children, dashboard = false }: { children: ReactNode; dashboard?: boolean }) {
+  return <div className="min-h-screen"><TopNav dashboard={dashboard} />{children}</div>;
+}
+
+function Pill({ children, tone = "green" }: { children: React.ReactNode; tone?: "green" | "amber" | "red" | "gray" }) {
+  const styles = { green: "bg-[#eaf5ed] text-[#39734d]", amber: "bg-[#fff4df] text-[#9b6b22]", red: "bg-[#fceceb] text-[#a34c47]", gray: "bg-[#eef1ef] text-[#68756d]" };
+  return <span className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[10px] font-semibold ${styles[tone]}`}>{children}</span>;
+}
+
+function ConsentStart({ onStart }: { onStart: (name: string, email: string, extraTime: boolean) => Promise<void> }) {
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [consent, setConsent] = useState(false);
+  const [extraTime, setExtraTime] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [error, setError] = useState("");
+  async function start() {
+    setStarting(true);
+    setError("");
+    try { await onStart(name.trim(), email.trim(), extraTime); }
+    catch (issue) { setError(issue instanceof Error ? issue.message : "Could not start your assessment."); }
+    finally { setStarting(false); }
+  }
+  return <div className="fixed inset-0 z-50 flex items-center justify-center overflow-y-auto bg-[#14221bcc] p-4 backdrop-blur-sm">
+    <div className="animate-rise my-auto max-h-[calc(100vh-2rem)] w-full max-w-[495px] overflow-y-auto rounded-[24px] border border-white/80 bg-[#fbfcfa] p-5 shadow-2xl sm:p-6">
+      <div className="flex items-center justify-between"><Logo /><span className="rounded-full bg-[#eef4ef] px-3 py-1 text-[10px] font-semibold uppercase tracking-wider text-[#5c8067]">Before you begin</span></div>
+      <div className="mt-5 grid size-11 place-items-center rounded-2xl bg-[#eaf4ed] text-[#457653]"><Eye size={20} /></div>
+      <h2 className="mt-3 text-[23px] font-semibold tracking-[-.04em]">Your work, your control.</h2>
+      <p className="mt-1.5 text-[12px] leading-5 text-[#738078]">A limited activity timeline helps reviewers understand your process. Here’s what is and isn’t collected.</p>
+      <div className="mt-4 space-y-2.5 rounded-2xl border border-[#e7ece8] bg-white p-3.5">
+        {[["Collected", "Keypress counts, edits, pastes, time, tab switches, and prompts and responses from the optional assistant."], ["Not collected", "No camera, microphone, screen capture, browsing history, or activity outside this task."], ["Your choice", "Recording starts only after consent. AI use alone is never proof of misconduct."], ["Retention", "Assessment records stay in local SQLite until cleared. Set DATA_RETENTION_DAYS on the API for automatic deletion; demo profiles are preserved."]].map(([title, detail]) => <div key={title} className="flex gap-3"><span className="mt-1 grid size-5 shrink-0 place-items-center rounded-full bg-[#edf5ef] text-[#51805f]"><Check size={12} /></span><p className="text-[10px] leading-[1.55] text-[#78847c]"><strong className="mr-1 font-semibold text-[#33483a]">{title}.</strong>{detail}</p></div>)}
+      </div>
+      <label className="mt-3 flex cursor-pointer items-start gap-3 rounded-xl p-1 text-[11px] leading-5 text-[#57655d]"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} className="mt-1 accent-[#2d6340]" /> I understand what is recorded and agree to share this process evidence with the hiring team.</label>
+      <label className="mt-3 block text-[11px] font-semibold text-[#57655d]">Your name
+        <input value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Maya Chen" className="mt-1.5 w-full rounded-xl border border-[#e2e8e3] bg-white px-3.5 py-3 text-[13px] font-normal outline-none transition focus:border-[#81af8c] focus:ring-4 focus:ring-[#e5f1e8]" />
+      </label>
+      <label className="mt-2 block text-[11px] font-semibold text-[#57655d]">Email <span className="font-normal text-[#9aa49c]">(optional)</span>
+        <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" className="mt-1.5 w-full rounded-xl border border-[#e2e8e3] bg-white px-3.5 py-3 text-[13px] font-normal outline-none transition focus:border-[#81af8c] focus:ring-4 focus:ring-[#e5f1e8]" />
+      </label>
+      <label className="mt-3 flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#67756c]"><input type="checkbox" checked={extraTime} onChange={(event) => setExtraTime(event.target.checked)} className="mt-0.5 accent-[#477e55]" />Accessibility option: add five minutes to the assessment timer.</label>
+      {error && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-3 py-2 text-[11px] text-[#a34c47]">{error}</p>}
+      <button disabled={!consent || !name.trim() || starting} onClick={start} className="mt-4 flex w-full items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad]">{starting ? "Preparing your task…" : "I consent and start"} {!starting && <ArrowRight size={15} />}</button>
+      <p className="mt-2 text-center text-[9px] text-[#9aa49d]">You can leave at any time. Evidence is used for this assessment only.</p>
+    </div>
+  </div>;
+}
+
+function Assessment() {
+  const navigate = useNavigate();
+  const [sessionId, setSessionId] = useState("");
+  const [consent, setConsent] = useState(false);
+  const [extraTime, setExtraTime] = useState(false);
+  const [name, setName] = useState("");
+  const [email, setEmail] = useState("");
+  const [code, setCode] = useState(starterCode);
+  const [taskVariant, setTaskVariant] = useState<TaskVariant | null>(null);
+  const [events, setEvents] = useState<TimelineEvent[]>([]);
+  const [prompts, setPrompts] = useState<Candidate["ai_prompts"]>([]);
+  const [elapsed, setElapsed] = useState(0);
+  const [timeRemaining, setTimeRemaining] = useState(20 * 60);
+  const [requirementUpdate, setRequirementUpdate] = useState("");
+  const [keypressCount, setKeypressCount] = useState(0);
+  const [prompt, setPrompt] = useState("");
+  const [assistantBusy, setAssistantBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [assistantOpen, setAssistantOpen] = useState(true);
+  const startAt = useRef(0);
+  const codeRef = useRef(code);
+  const eventCount = useRef(0);
+  const keypresses = useRef(0);
+  const recordingEnabled = useRef(false);
+  const eventQueue = useRef<TimelineEvent[]>([]);
+  const flushInProgress = useRef(false);
+  const lastActivity = useRef(Date.now());
+  const idleStarted = useRef(0);
+
+  const stamp = useCallback(() => {
+    const seconds = Math.floor((Date.now() - startAt.current) / 1000);
+    return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+  }, []);
+  const pushEvent = useCallback((event: Pick<TimelineEvent, "type" | "detail"> & Partial<Pick<TimelineEvent, "count" | "characters">>) => {
+    const timestamp = new Date().toISOString();
+    const item: TimelineEvent = {
+      ...event,
+      id: crypto.randomUUID(),
+      timestamp,
+      time: stamp(),
+      count: event.count ?? 1,
+    };
+    eventQueue.current.push(item);
+    setEvents((current) => [...current, item]);
+  }, [stamp]);
+
+  const flushEvents = useCallback(async () => {
+    if (!sessionId || !eventQueue.current.length) return !flushInProgress.current;
+    if (flushInProgress.current) return false;
+    flushInProgress.current = true;
+    const batch = eventQueue.current.splice(0, 100);
+    try {
+      await api.sessionEvents(sessionId, batch);
+      return true;
+    } catch (issue) {
+      eventQueue.current.unshift(...batch);
+      setError(issue instanceof Error ? issue.message : "Could not save your activity timeline.");
+      return false;
+    } finally {
+      flushInProgress.current = false;
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!consent || !sessionId) return;
+    const started = Date.now();
+    startAt.current = started;
+    recordingEnabled.current = true;
+    lastActivity.current = started;
+    const assessmentLimit = 20 * 60 + (extraTime ? 300 : 0);
+    const timer = window.setInterval(() => {
+      const seconds = Math.floor((Date.now() - started) / 1000);
+      setElapsed(seconds);
+      setTimeRemaining(Math.max(0, assessmentLimit - seconds));
+    }, 1000);
+    const visibility = () => {
+      if (document.visibilityState === "hidden") {
+        pushEvent({ type: "tab", detail: "Assessment tab lost focus" });
+      }
+    };
+    const blur = () => pushEvent({ type: "blur", detail: "Assessment window lost focus" });
+    const activity = () => {
+      if (idleStarted.current) {
+        const idleSeconds = Math.max(1, Math.round((Date.now() - idleStarted.current) / 1000));
+        pushEvent({ type: "idle", detail: `Returned after ${idleSeconds} seconds without activity`, count: idleSeconds });
+        idleStarted.current = 0;
+      }
+      lastActivity.current = Date.now();
+    };
+    const idleTimer = window.setInterval(() => {
+      if (!idleStarted.current && Date.now() - lastActivity.current >= 30000) idleStarted.current = lastActivity.current;
+    }, 5000);
+    const batchTimer = window.setInterval(() => { void flushEvents(); }, 4000);
+    document.addEventListener("visibilitychange", visibility);
+    window.addEventListener("blur", blur);
+    window.addEventListener("pointerdown", activity);
+    window.addEventListener("keydown", activity);
+    return () => {
+      recordingEnabled.current = false;
+      window.clearInterval(timer);
+      window.clearInterval(idleTimer);
+      window.clearInterval(batchTimer);
+      document.removeEventListener("visibilitychange", visibility);
+      window.removeEventListener("blur", blur);
+      window.removeEventListener("pointerdown", activity);
+      window.removeEventListener("keydown", activity);
+      void flushEvents();
+    };
+  }, [consent, extraTime, flushEvents, pushEvent, sessionId]);
+
+  useEffect(() => {
+    if (!sessionId || !consent) return;
+    let active = true;
+    const check = async () => {
+      try {
+        const result = await api.requirementChange(sessionId);
+        if (!active || !result.fired || requirementUpdate) return;
+        setRequirementUpdate(result.message || "Also handle records with missing values for the selected field.");
+        await api.acknowledgeRequirementChange(sessionId);
+      } catch (issue) {
+        if (active) setError(issue instanceof Error ? issue.message : "Could not check for task updates.");
+      }
+    };
+    void check();
+    const timer = window.setInterval(() => { void check(); }, 3000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, [consent, requirementUpdate, sessionId]);
+
+  const onEditorMount = (editor: Parameters<NonNullable<ComponentProps<typeof Editor>["onMount"]>>[0]) => {
+    editor.onDidChangeModelContent((change) => {
+      if (!recordingEnabled.current) return;
+      const count = Math.max(1, change.changes.length);
+      const characters = change.changes.reduce((sum, item) => sum + item.text.length, 0);
+      eventCount.current += count;
+      pushEvent({ type: "edit", detail: "Edited solution in code editor", count, characters });
+    });
+    const element = editor.getDomNode();
+    element?.addEventListener("paste", (event) => {
+      if (!recordingEnabled.current) return;
+      const pasted = (event as ClipboardEvent).clipboardData?.getData("text") || "";
+      const count = pasted ? pasted.split("\n").length : 1;
+      pushEvent({ type: "paste", detail: `Pasted ${pasted.length} characters into editor`, count, characters: pasted.length });
+    }, true);
+    editor.onKeyDown((event) => {
+      if (!recordingEnabled.current || ["Shift", "Control", "Alt", "Meta", "CapsLock"].includes(event.browserEvent.key)) return;
+      keypresses.current += 1;
+      setKeypressCount(keypresses.current);
+    });
+  };
+  async function askAssistant(event: FormEvent) {
+    event.preventDefault();
+    if (!prompt.trim() || !sessionId) return;
+    const value = prompt.trim();
+    setPrompt("");
+    setAssistantBusy(true);
+    setError("");
+    try {
+      const result = await api.sessionAssistant(sessionId, value);
+      setPrompts((current) => [...current, {
+        id: result.prompt.id,
+        prompt: value,
+        response: result.answer,
+        verified: false,
+        seeded_mistake: result.prompt.seeded_mistake,
+        summary: summarizePrompt(value),
+      }]);
+    } catch (issue) { setError(issue instanceof Error ? issue.message : "Assistant unavailable."); }
+    finally { setAssistantBusy(false); }
+  }
+  async function markSuggestion(item: Candidate["ai_prompts"][number], verified: boolean) {
+    if (!sessionId || !item.id) return;
+    try {
+      await api.verifyPrompt(sessionId, item.id, verified);
+      setPrompts((current) => current.map((promptItem) => promptItem.id === item.id ? {
+        ...promptItem,
+        verified,
+        summary: verified ? "Candidate marked the suggestion as checked and understood." : "Prompt sent; candidate has not marked it as checked.",
+      } : promptItem));
+    } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not save your verification."); }
+  }
+  function runSampleChecks() {
+    if (!recordingEnabled.current) return;
+    pushEvent({ type: "run", detail: "Recorded a sample-check attempt; editor code was not executed." });
+  }
+  async function submit() {
+    if (!sessionId) return;
+    setSubmitting(true);
+    setError("");
+    try {
+      const flushed = await flushEvents();
+      if (!flushed || eventQueue.current.length) throw new Error("Your activity timeline could not be saved. Please try submitting again.");
+      const saved = await api.submitAssessment({ name, email, code: codeRef.current, consent: true, session_id: sessionId, events, ai_prompts: prompts, duration_seconds: elapsed, keystrokes: keypresses.current });
+      await api.questions(saved.id, taskVariant?.description);
+      navigate(`/viva/${saved.id}`);
+    } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not submit assessment."); }
+    finally { setSubmitting(false); }
+  }
+  async function startSession(candidateName: string, candidateEmail: string, extraTime: boolean) {
+    const session = await api.startSession(candidateName, candidateEmail, extraTime);
+    setName(candidateName);
+    setEmail(candidateEmail);
+    setExtraTime(extraTime);
+    setSessionId(session.session_id);
+    setTaskVariant(session.task_variant);
+    setCode(`function groupBy${session.task_variant.field[0].toUpperCase()}${session.task_variant.field.slice(1)}(items) {\n  return items.reduce((groups, item) => {\n    const value = item.${session.task_variant.field};\n    (groups[value] ??= []).push(item);\n    return groups;\n  }, {});\n}`);
+    codeRef.current = `function groupBy${session.task_variant.field[0].toUpperCase()}${session.task_variant.field.slice(1)}(items) {\n  return items.reduce((groups, item) => {\n    const value = item.${session.task_variant.field};\n    (groups[value] ??= []).push(item);\n    return groups;\n  }, {});\n}`;
+    setTimeRemaining(20 * 60 + (extraTime ? 300 : 0));
+    setConsent(true);
+  }
+  const time = `${String(Math.floor(timeRemaining / 60)).padStart(2, "0")}:${String(timeRemaining % 60).padStart(2, "0")}`;
+
+  return <PageFrame>
+    {!consent && <ConsentStart onStart={startSession} />}
+    <main className="mx-auto max-w-[1370px] px-4 pb-8 pt-5 sm:px-6 lg:px-8">
+      <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-2 text-xs text-[#87938b]"><Link to="/" className="hover:text-[#395c44]">Home</Link><ChevronRight size={13} /><span className="font-medium text-[#3d4d43]">Assessment</span></div>
+        <div className="flex items-center gap-2"><span className={`flex items-center gap-1.5 rounded-full px-2.5 py-1.5 text-[10px] font-semibold ${consent ? "bg-[#eaf5ed] text-[#43805a]" : "bg-[#eff2ef] text-[#78857d]"}`}><span className={`size-1.5 rounded-full ${consent ? "animate-pulse bg-[#4eaa6a]" : "bg-[#a6b0a9]"}`} />{consent ? "Recording process (with consent)" : "Recording paused"}</span><span className="rounded-full border border-[#e4eae5] bg-white px-3 py-1.5 text-[11px] tabular-nums text-[#65736a]"><Clock3 className="mr-1 inline" size={12} />{time} left</span></div>
+      </div>
+      {requirementUpdate && <div role="status" className="requirement-banner mb-4 rounded-2xl border border-[#f0dfbd] bg-[#fff9eb] px-5 py-3.5 text-[12px] leading-5 text-[#82652e]"><strong>Requirement update:</strong> {requirementUpdate}</div>}
+      <div className="grid items-start gap-4 xl:grid-cols-[270px_minmax(0,1fr)_300px]">
+        <aside className="rounded-[20px] border border-[#e5ebe6] bg-white p-5 shadow-[0_6px_25px_#17321b08]">
+          <div className="flex items-center gap-2"><span className="grid size-8 place-items-center rounded-lg bg-[#edf5ef] text-[#4c7b5b]"><FileCode2 size={16} /></span><div><h1 className="text-[13px] font-semibold">{taskVariant?.title || "Your task"}</h1><Pill tone="gray">JavaScript</Pill></div></div>
+          <h2 className="mt-5 text-[10px] font-semibold uppercase tracking-[.11em] text-[#819087]">Task description</h2>
+          <p className="mt-2 text-[12px] leading-5 text-[#55645b]">{taskVariant?.description || "Prepare your individualized task."}</p>
+          <h2 className="mt-5 text-[10px] font-semibold uppercase tracking-[.11em] text-[#819087]">Sample records</h2>
+          <pre className="mt-2 overflow-auto rounded-xl bg-[#f7faf7] p-3 text-[10px] leading-5 text-[#66756b]">{JSON.stringify(taskVariant?.dataset || [], null, 2)}</pre>
+          <h2 className="mt-5 text-[10px] font-semibold uppercase tracking-[.11em] text-[#819087]">Consider</h2>
+          <ul className="mt-2 space-y-2 text-[11px] leading-5 text-[#627168]"><li>What should happen with empty input?</li><li>How should missing or special keys behave?</li><li>What will you test after changing your approach?</li></ul>
+          <p className="mt-5 rounded-xl border border-[#e8ece8] bg-[#fafcfb] p-3 text-[10px] leading-4 text-[#89958d]">Your sample checks are recorded but do not execute candidate code in this demo.</p>
+        </aside>
+        <section className="overflow-hidden rounded-[20px] border border-[#e5ebe6] bg-white shadow-[0_6px_25px_#17321b08]">
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-[#edf0ed] px-5 py-4">
+            <div><h2 className="text-[13px] font-semibold">Solution editor</h2><p className="mt-1 text-[10px] text-[#89958d]">Make changes in small steps and verify edge cases.</p></div>
+            <button onClick={() => setAssistantOpen((open) => !open)} className="inline-flex items-center gap-2 rounded-full border border-[#e4ebe5] px-3 py-2 text-[11px] font-semibold text-[#52645a] hover:bg-[#f5f9f6] xl:hidden"><Sparkles size={14} /> {assistantOpen ? "Hide assistant" : "AI assistant"}</button>
+          </div>
+          <div className="editor-shell h-[430px] overflow-hidden bg-[#111b18] sm:h-[500px]">
+            <Editor height="100%" defaultLanguage="javascript" theme="vs-dark" value={code} onChange={(value) => { codeRef.current = value || ""; setCode(value || ""); }} onMount={onEditorMount} options={{ minimap: { enabled: false }, fontSize: 13, lineHeight: 23, padding: { top: 18 }, scrollBeyondLastLine: false, wordWrap: "on", tabSize: 2, automaticLayout: true, renderLineHighlight: "line", guides: { indentation: true }, scrollbar: { verticalScrollbarSize: 7 } }} />
+          </div>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0ed] bg-[#fcfdfb] px-5 py-3">
+            <div className="flex flex-wrap items-center gap-3 text-[10px] text-[#8a968f]"><span className="flex items-center gap-1.5"><Code2 size={12} />{eventCount.current} edits</span><span className="flex items-center gap-1.5"><KeyRound size={12} />{keypressCount} keys</span><span className="flex items-center gap-1.5"><Upload size={12} />{events.filter((item) => item.type === "paste").length} pastes</span></div>
+            <div className="flex items-center gap-2"><button onClick={runSampleChecks} disabled={!consent} className="rounded-full border border-[#e4ebe5] px-3.5 py-2 text-[10px] font-semibold text-[#52645a] disabled:opacity-50">Record test attempt</button><button onClick={submit} disabled={!consent || submitting || assistantBusy} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-2.5 text-[12px] font-semibold text-white transition hover:bg-[#28523d] disabled:cursor-not-allowed disabled:bg-[#aab8ad]">{submitting ? "Preparing viva…" : "Submit & continue"}<ArrowRight size={14} /></button></div>
+          </div>
+          {error && <p role="alert" className="border-t border-[#f3d7d4] bg-[#fff7f6] px-5 py-3 text-xs text-[#a34c47]">{error}</p>}
+        </section>
+        <aside className={`${assistantOpen ? "block" : "hidden"} overflow-hidden rounded-[20px] border border-[#e5ebe6] bg-white shadow-[0_6px_25px_#17321b08] xl:block`}>
+          <div className="flex items-center justify-between border-b border-[#edf0ed] px-4 py-4"><div className="flex items-center gap-2.5"><span className="grid size-8 place-items-center rounded-lg bg-[#f0effb] text-[#7167a8]"><Sparkles size={15} /></span><div><h2 className="text-[12px] font-semibold">AI assistant</h2><p className="text-[10px] text-[#98a29b]">Hints, not answers</p></div></div><button onClick={() => setAssistantOpen(false)} className="text-[#98a29b] xl:hidden" aria-label="Close assistant"><X size={15} /></button></div>
+          <div className="max-h-[440px] min-h-[280px] space-y-3 overflow-y-auto px-4 py-4">
+            <div className="rounded-xl border border-[#eeeafa] bg-[#faf9ff] p-3.5"><div className="flex gap-2 text-[11px] leading-[1.65] text-[#6c668b]"><Lightbulb size={14} className="mt-0.5 shrink-0" />Ask about a concept, edge case, or tradeoff. Your prompts are shared with the hiring team so they can understand how you used assistance.</div></div>
+            {assistantBusy && <div className="mt-4 flex items-center gap-2 text-[11px] text-[#7a718f]"><span className="size-1.5 animate-pulse rounded-full bg-[#8177bb]" />Thinking through a hint…</div>}
+            {prompts.map((item, index) => <div key={item.id || `${item.prompt}-${index}`} className="space-y-2 animate-rise"><div className="ml-5 rounded-xl bg-[#edf4ef] p-3 text-[10px] leading-4 text-[#52645a]">{item.prompt}</div><div className="mr-4 rounded-xl bg-[#f4f6f4] p-3 text-[10px] leading-[1.65] text-[#56645b]">{item.response}</div><label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#718078]"><input type="checkbox" checked={item.verified} onChange={(event) => void markSuggestion(item, event.target.checked)} className="mt-0.5 accent-[#477e55]" />I checked this suggestion and understand it</label></div>)}
+          </div>
+          <form onSubmit={askAssistant} className="border-t border-[#edf0ed] bg-[#fcfdfb] p-3">
+            <textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Ask for a hint or explanation…" rows={3} className="w-full resize-none rounded-xl border border-[#e6ebe7] bg-white p-3 text-[11px] leading-5 outline-none focus:border-[#aaa3d0]" />
+            <button disabled={!prompt.trim() || assistantBusy} className="mt-2 flex w-full items-center justify-center gap-2 rounded-xl bg-[#eceaf7] py-2.5 text-[11px] font-semibold text-[#6a6396] transition hover:bg-[#e1def2] disabled:opacity-50"><WandSparkles size={13} />Ask assistant</button>
+          </form>
+        </aside>
+      </div>
+      <p className="mt-4 text-center text-[10px] text-[#9aa59d]">Your process is visible only to the hiring team you share it with. <Link className="underline underline-offset-2" to="/">Privacy details</Link></p>
+    </main>
+  </PageFrame>;
+}
+
+function Viva() {
+  const { id = "" } = useParams();
+  const navigate = useNavigate();
+  const [questions, setQuestions] = useState<VivaAnswer[]>([]);
+  const [current, setCurrent] = useState(0);
+  const [answer, setAnswer] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [lastFeedback, setLastFeedback] = useState<{ score: number; reason: string } | null>(null);
+  useEffect(() => {
+    api.candidate(id).then((candidate) => {
+      if (candidate.viva.length) setQuestions(candidate.viva);
+      else api.questions(id).then((result) => setQuestions(result.questions)).catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load viva."));
+    }).catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load viva."));
+  }, [id]);
+  const active = questions[current];
+  async function submitAnswer(event: FormEvent) {
+    event.preventDefault();
+    if (!active || !answer.trim()) return;
+    setBusy(true);
+    setError("");
+    try {
+      const result = await api.answer(id, current, answer);
+      const next = questions.map((item, index) => index === current ? result.answer : item);
+      setQuestions(next);
+      setLastFeedback({ score: result.score_10, reason: result.reason });
+      setAnswer("");
+      if (current + 1 < next.length) setCurrent(current + 1);
+      else navigate(`/live-check/${id}`);
+    } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not save your answer."); }
+    finally { setBusy(false); }
+  }
+  return <PageFrame><main className="mx-auto max-w-[850px] px-5 py-10 sm:py-14">
+    <Link to="/assessment" className="inline-flex items-center gap-2 text-[12px] font-medium text-[#718078] hover:text-[#375b43]"><ArrowLeft size={14} /> Back to task</Link>
+    <div className="mt-8 rounded-[24px] border border-[#e5ebe6] bg-white p-6 shadow-[0_12px_50px_#17321b0a] sm:p-9">
+      <div className="flex items-start justify-between"><div><Pill><Sparkles size={11} /> AI viva</Pill><h1 className="mt-4 text-[30px] font-semibold tracking-[-.045em]">Talk us through your thinking.</h1><p className="mt-2 max-w-[560px] text-[13px] leading-6 text-[#748078]">A few short questions about the code you just wrote. Your answers help reviewers understand your reasoning, not your ability to memorize definitions.</p></div><span className="hidden size-11 place-items-center rounded-2xl bg-[#eef4ef] text-[#548164] sm:grid"><BrainCircuit size={21} /></span></div>
+      <div className="mt-7 flex items-center gap-2">{questions.map((_, index) => <div key={index} className={`h-1.5 flex-1 rounded-full ${index <= current ? "bg-[#5a9a6d]" : "bg-[#e8ede9]"}`} />)}</div>
+      <div className="mt-2 flex justify-between text-[10px] font-medium text-[#95a098]"><span>Question {questions.length ? current + 1 : 0} of {questions.length || 5}</span><span>About {Math.max(1, Math.ceil(((questions.length || 5) - current) * 0.4))} min remaining</span></div>
+      {lastFeedback && <div role="status" className="mt-4 rounded-xl border border-[#e5ebe6] bg-[#f7faf7] px-4 py-3 text-[11px] leading-5 text-[#65736a]"><strong className="text-[#3f704c]">Previous answer: {lastFeedback.score}/10.</strong> {lastFeedback.reason}</div>}
+      <form onSubmit={submitAnswer} className="mt-7">
+        <div className="rounded-2xl border border-[#e7ece8] bg-[#fafbf9] p-5 sm:p-6">
+          {active ? <><div className="text-[10px] font-semibold uppercase tracking-[.12em] text-[#7b8f80]">Question {current + 1}</div><h2 className="mt-2 text-[19px] font-semibold leading-7 tracking-[-.02em]">{active.question}</h2></> : <div className="flex items-center gap-2 py-4 text-sm text-[#758178]"><span className="size-2 animate-pulse rounded-full bg-[#68a57a]" />Preparing questions for your code…</div>}
+          <label htmlFor="viva-answer" className="mt-5 block text-[10px] font-semibold text-[#87938b]">Your answer</label>
+          <textarea id="viva-answer" value={answer} onChange={(event) => setAnswer(event.target.value)} disabled={!active || busy} placeholder="Take a moment to explain your reasoning…" rows={5} className="mt-2 w-full resize-y rounded-xl border border-[#e3e9e4] bg-white p-4 text-[13px] leading-6 outline-none transition placeholder:text-[#a3ada6] focus:border-[#81af8c] focus:ring-4 focus:ring-[#e7f2e9] disabled:opacity-60" />
+        </div>
+        {error && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
+        <div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-[11px] text-[#89958d]">Your answer is scored for demonstrated understanding.</p><button disabled={!active || !answer.trim() || busy} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{busy ? "Reviewing…" : current + 1 === questions.length ? "Finish viva" : "Next question"}<ArrowRight size={14} /></button></div>
+      </form>
+    </div>
+    <div className="mt-4 flex items-center justify-center gap-2 text-[10px] text-[#98a29b]"><LockKeyhole size={12} />Your answers are shared with the hiring team for this assessment only.</div>
+  </main></PageFrame>;
+}
+
+function LiveCheckChallenge() {
+  const { id = "" } = useParams();
+  const navigate = useNavigate();
+  const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [error, setError] = useState("");
+  const [consent, setConsent] = useState(false);
+  const [extraTime, setExtraTime] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [remaining, setRemaining] = useState(240);
+  const [selectedFix, setSelectedFix] = useState("plain-object");
+  const [attempts, setAttempts] = useState(0);
+  const [lastTest, setLastTest] = useState<number | null>(null);
+  const [testResults, setTestResults] = useState<boolean[] | null>(null);
+  const [focusChanges, setFocusChanges] = useState(0);
+  const [blurEvents, setBlurEvents] = useState(0);
+  const [idlePeriods, setIdlePeriods] = useState<number[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const lastActivity = useRef(Date.now());
+  const idleStarted = useRef(0);
+  const duration = extraTime ? 360 : 240;
+  const requirementChanged = running && duration - remaining >= 45;
+
+  useEffect(() => {
+    api.candidate(id).then((value) => {
+      setCandidate(value);
+      setExtraTime(Boolean(value.extra_time));
+    }).catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load live skill check."));
+  }, [id]);
+
+  useEffect(() => {
+    if (!running) return;
+    lastActivity.current = Date.now();
+    const timer = window.setInterval(() => {
+      setRemaining((value) => Math.max(0, value - 1));
+    }, 1000);
+    const visibility = () => {
+      if (document.visibilityState === "hidden") setFocusChanges((value) => value + 1);
+    };
+    const blur = () => {
+      setBlurEvents((value) => value + 1);
+      setFocusChanges((value) => value + 1);
+    };
+    const activity = () => {
+      if (idleStarted.current) {
+        const idleSeconds = Math.max(1, Math.round((Date.now() - idleStarted.current) / 1000));
+        setIdlePeriods((current) => [...current, idleSeconds]);
+        idleStarted.current = 0;
+      }
+      lastActivity.current = Date.now();
+    };
+    const idleTimer = window.setInterval(() => {
+      if (!idleStarted.current && Date.now() - lastActivity.current >= 30000) idleStarted.current = lastActivity.current;
+    }, 5000);
+    document.addEventListener("visibilitychange", visibility);
+    window.addEventListener("blur", blur);
+    window.addEventListener("pointerdown", activity);
+    window.addEventListener("keydown", activity);
+    return () => {
+      window.clearInterval(timer);
+      window.clearInterval(idleTimer);
+      document.removeEventListener("visibilitychange", visibility);
+      window.removeEventListener("blur", blur);
+      window.removeEventListener("pointerdown", activity);
+      window.removeEventListener("keydown", activity);
+      if (idleStarted.current) {
+        const idleSeconds = Math.max(1, Math.round((Date.now() - idleStarted.current) / 1000));
+        setIdlePeriods((current) => [...current, idleSeconds]);
+        idleStarted.current = 0;
+      }
+    };
+  }, [running]);
+  useEffect(() => {
+    if (running && remaining === 0) setRunning(false);
+  }, [remaining, running]);
+
+  function runTests() {
+    if (!running) return;
+    setAttempts((value) => value + 1);
+    const results = selectedFix === "null-prototype" ? [true, true, true, true] :
+      selectedFix === "validate-key" ? [true, true, false, true] : [true, true, false, false];
+    setTestResults(results);
+    setLastTest(results.filter(Boolean).length);
+  }
+
+  async function submitCheck() {
+    if (lastTest === null || !candidate) return;
+    setSubmitting(true);
+    setError("");
+    const passed = lastTest;
+    try {
+      await api.liveCheck(id, {
+        passed,
+        total: 4,
+        attempts,
+        duration_seconds: Math.min(duration, Math.max(0, duration - remaining)),
+        focus_changes: focusChanges,
+        blur_events: blurEvents,
+        idle_periods: idlePeriods,
+        selected_fix: selectedFix,
+        requirement_change_seen: requirementChanged,
+      });
+      const complete = await api.complete(id);
+      navigate(`/candidates/${complete.id}`);
+    } catch (issue) {
+      setError(issue instanceof Error ? issue.message : "Could not save your live skill check.");
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const time = `${String(Math.floor(remaining / 60)).padStart(2, "0")}:${String(remaining % 60).padStart(2, "0")}`;
+  if (error && !candidate) return <PageFrame><main className="mx-auto max-w-3xl px-5 py-20"><p role="alert" className="rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</p></main></PageFrame>;
+  if (!candidate) return <PageFrame><main className="mx-auto max-w-3xl px-5 py-20 text-sm text-[#849087]">Loading live skill check…</main></PageFrame>;
+  if (candidate.live_check) return <PageFrame><main className="mx-auto max-w-[760px] px-5 py-14">
+    <div className="rounded-[24px] border border-[#e5ebe6] bg-white p-7 text-center shadow-[0_12px_50px_#17321b0a]">
+      <CheckCircle2 className="mx-auto text-[#4e9666]" size={28} />
+      <h1 className="mt-4 text-2xl font-semibold">Live skill check recorded</h1>
+      <p className="mt-2 text-sm text-[#738078]">{candidate.live_check.passed} of {candidate.live_check.total} tests passed.</p>
+      <Link to={`/candidates/${candidate.id}`} className="mt-6 inline-flex rounded-full bg-[#1d3d2e] px-5 py-3 text-xs font-semibold text-white">View assessment report</Link>
+    </div>
+  </main></PageFrame>;
+
+  return <PageFrame><main className="mx-auto max-w-[1050px] px-5 pb-12 pt-8">
+    <Link to={`/viva/${id}`} className="inline-flex items-center gap-2 text-[11px] font-medium text-[#77847c]"><ArrowLeft size={13} /> Viva</Link>
+    <div className="mt-5 flex flex-wrap items-end justify-between gap-4">
+      <div><Pill><Code2 size={11} /> Final practical check</Pill><h1 className="mt-3 text-[30px] font-semibold tracking-[-.05em]">Debug a grouping edge case.</h1><p className="mt-2 max-w-[640px] text-[13px] leading-6 text-[#748078]">A short, timed follow-up about a JavaScript object-key bug. Choose a fix, run the focused test suite, and explain the evidence in the report.</p></div>
+      <div className={`rounded-2xl border px-4 py-3 ${remaining < 45 ? "border-[#f0d7d4] bg-[#fff6f5] text-[#a34c47]" : "border-[#e5ebe6] bg-white text-[#344b3b]"}`}><div className="text-[9px] font-semibold uppercase tracking-[.12em] opacity-70">Time remaining</div><div className="mt-1 flex items-center gap-2 font-mono text-2xl font-semibold"><Clock3 size={17} />{time}</div></div>
+    </div>
+    <div className="mt-6 grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(280px,.7fr)]">
+      <section className="overflow-hidden rounded-[20px] border border-[#e5ebe6] bg-white">
+        <div className="border-b border-[#edf0ed] px-5 py-4"><h2 className="text-sm font-semibold">The bug</h2><p className="mt-1 text-[11px] leading-5 text-[#78847c]">The current accumulator uses a normal object. Grouping a key such as <code>__proto__</code> can collide with inherited object properties.</p></div>
+        <pre className="overflow-auto bg-[#111b18] p-5 font-mono text-[11px] leading-6 text-[#c0d0c4]">{`function groupBy(items, key) {
+  return items.reduce((groups, item) => {
+    const value = item[key];
+    (groups[value] ??= []).push(item);
+    return groups;
+  }, {});
+}`}</pre>
+        <div className="space-y-2 p-5">
+          {requirementChanged && <div role="status" className="mx-5 mt-4 rounded-xl border border-[#f0dfbd] bg-[#fff9eb] p-3.5 text-[10px] leading-5 text-[#82652e]"><strong>Requirement update:</strong> also account for items where the selected property is missing. Explain how your chosen approach handles that case.</div>}
+          {[["plain-object", "Keep a regular {} accumulator", "Works for ordinary strings, but inherited keys can collide."], ["validate-key", "Check hasOwnProperty before appending", "Guards lookup, but assignment to special object keys remains unsafe."], ["null-prototype", "Create the accumulator with Object.create(null)", "Avoids inherited property names while preserving object-style grouping."]].map(([value, title, description]) => <label key={value} className={`flex cursor-pointer gap-3 rounded-xl border p-3.5 transition ${selectedFix === value ? "border-[#9cc5a5] bg-[#f4faf5]" : "border-[#e7ece8] hover:bg-[#fafcfb]"}`}>
+            <input type="radio" name="fix" value={value} checked={selectedFix === value} onChange={() => setSelectedFix(value)} disabled={!running} className="mt-1 accent-[#39734d]" />
+            <span><span className="block text-[11px] font-semibold text-[#46564b]">{title}</span><span className="mt-1 block text-[10px] leading-4 text-[#849087]">{description}</span></span>
+          </label>)}
+        </div>
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-[#edf0ed] bg-[#fcfdfb] px-5 py-4">
+          <span className="text-[10px] text-[#89958d]">Attempts: {attempts}{lastTest !== null && <span className="ml-2">· Last run: {lastTest}/4 passed</span>}</span>
+          <button onClick={runTests} disabled={!running || remaining === 0} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]"><Code2 size={13} />Run tests</button>
+        </div>
+        {lastTest !== null && <div aria-live="polite" className="border-t border-[#edf0ed] px-5 py-4">
+          <div className="mb-2 text-[11px] font-semibold text-[#56645b]">Focused test results</div>
+          {["Ordinary category values", "Empty input", "Prototype-sensitive key (__proto__)", "Missing selected property"].map((test, index) => {
+            const passed = testResults?.[index] ?? false;
+            return <div key={test} className="flex items-center justify-between border-t border-[#f1f3f1] py-2 text-[10px]"><span className="text-[#748078]">{test}</span><span className={passed ? "font-medium text-[#4c805a]" : "font-medium text-[#a34c47]"}>{passed ? "Passed" : "Failed"}</span></div>;
+          })}
+        </div>}
+      </section>
+      <aside className="space-y-4">
+        <section className="rounded-[20px] border border-[#e5ebe6] bg-white p-5">
+          <h2 className="text-[12px] font-semibold">Before you start</h2>
+          <p className="mt-2 text-[10px] leading-5 text-[#7b887e]">This demo challenge uses a constrained fix selector. It does not execute submitted code. With your consent, we record test attempts, elapsed time, tab switches, window-focus loss, and long idle periods. No camera or microphone is used.</p>
+          {!running && <div className="mt-4 space-y-3">
+            <label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#67756c]"><input type="checkbox" checked={consent} onChange={(event) => setConsent(event.target.checked)} className="mt-0.5 accent-[#477e55]" />I understand this timed check records test attempts, time, and tab visibility.</label>
+            <label className="flex cursor-pointer items-start gap-2 text-[10px] leading-4 text-[#67756c]"><input type="checkbox" checked={extraTime} onChange={(event) => setExtraTime(event.target.checked)} className="mt-0.5 accent-[#477e55]" />Accessibility option: add two minutes</label>
+            <button onClick={() => { setRemaining(duration); setRunning(true); }} disabled={!consent} className="w-full rounded-full bg-[#1d3d2e] px-4 py-3 text-[11px] font-semibold text-white disabled:bg-[#aab8ad]">Start {Math.round(duration / 60)}-minute check</button>
+          </div>}
+          {running && <div className="mt-4 flex items-center gap-2 rounded-xl bg-[#edf6ef] p-3 text-[10px] font-medium text-[#4d805b]"><span className="size-2 animate-pulse rounded-full bg-[#55a66d]" />Timed check active · visibility monitoring on</div>}
+          {remaining === 0 && <p className="mt-3 text-[10px] text-[#9b6b22]">Time is up. Save the latest test result to continue.</p>}
+        </section>
+        <section className="rounded-[20px] border border-[#e5ebe6] bg-[#f7faf7] p-5">
+          <div className="flex items-center justify-between"><h2 className="text-[11px] font-semibold text-[#435349]">Progress</h2><span className="text-[10px] text-[#859188]">{lastTest ?? 0}/4 tests passed</span></div>
+          <div className="mt-3 h-2 overflow-hidden rounded-full bg-[#e6ece7]"><div className="h-full rounded-full bg-[#69a579] transition-all" style={{ width: `${((lastTest ?? 0) / 4) * 100}%` }} /></div>
+          <p className="mt-3 text-[9px] leading-4 text-[#89958d]">A test result is one part of the evidence. Focus changes and test attempts are not standalone decisions.</p>
+        </section>
+        {error && <p role="alert" className="rounded-xl bg-[#fff4f2] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
+        <button onClick={submitCheck} disabled={!candidate || lastTest === null || submitting} className="w-full rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{submitting ? "Saving evidence…" : "Finish & view report"}<ArrowRight className="ml-2 inline" size={14} /></button>
+      </aside>
+    </div>
+  </main></PageFrame>;
+}
+
+function VerdictTone({ verdict }: { verdict: Candidate["verdict"] }) {
+  const tone = verdict === "Verified skill" ? "green" : verdict === "Needs review" ? "amber" : "red";
+  const Icon = verdict === "Verified skill" ? BadgeCheck : verdict === "Needs review" ? CircleHelp : Flag;
+  return <Pill tone={tone}><Icon size={12} />{verdict}</Pill>;
+}
+
+function ScoreRing({ score, size = 68 }: { score: number; size?: number }) {
+  return <div className="relative grid shrink-0 place-items-center rounded-full" style={{ width: size, height: size, background: `conic-gradient(#4e9666 ${Math.max(0, Math.min(score, 100)) * 3.6}deg, #e9eee9 0deg)` }}>
+    <div className="grid place-items-center rounded-full bg-white" style={{ width: size - 7, height: size - 7 }}><span className="text-[18px] font-semibold tracking-tight text-[#23362a]">{score}<span className="text-[9px] text-[#94a098]">%</span></span></div>
+  </div>;
+}
+
+function Dashboard() {
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [filter, setFilter] = useState("All");
+  const [query, setQuery] = useState("");
+  useEffect(() => {
+    api.candidates()
+      .then(setCandidates)
+      .catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load candidate list."))
+      .finally(() => setLoading(false));
+  }, []);
+  const filtered = useMemo(() => candidates.filter((candidate) =>
+    (filter === "All" || candidate.verdict === filter) &&
+    `${candidate.name} ${candidate.role} ${candidate.task_variant || ""}`.toLowerCase().includes(query.toLowerCase()),
+  ), [candidates, filter, query]);
+  const verified = candidates.filter((candidate) => candidate.verdict === "Verified skill").length;
+  const review = candidates.filter((candidate) => candidate.verdict === "Needs review").length;
+  const lowConfidence = candidates.filter((candidate) => candidate.verdict === "Low confidence").length;
+  const averageScore = candidates.length ? Math.round(candidates.reduce((sum, candidate) => sum + candidate.score, 0) / candidates.length) : 0;
+  return <PageFrame dashboard><div className="mx-auto grid max-w-[1450px] gap-5 px-5 pb-12 pt-6 lg:grid-cols-[215px_minmax(0,1fr)] lg:px-8">
+    <aside className="h-fit rounded-[20px] border border-[#e6ece7] bg-white p-3 shadow-[0_6px_20px_#1c352808] lg:sticky lg:top-24">
+      <div className="px-3 py-2 text-[9px] font-semibold uppercase tracking-[.14em] text-[#9aa49c]">Workspace</div>
+      <Link to="/dashboard" className="flex items-center gap-2.5 rounded-xl bg-[#edf5ef] px-3 py-2.5 text-[11px] font-semibold text-[#426f4d]"><LayoutDashboard size={14} /> Candidate overview</Link>
+      <Link to="/verify" className="mt-1 flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-[11px] font-medium text-[#728078] hover:bg-[#f7faf7]"><BadgeCheck size={14} /> Credential verification</Link>
+      <Link to="/assessment" className="mt-1 flex items-center gap-2.5 rounded-xl px-3 py-2.5 text-[11px] font-medium text-[#728078] hover:bg-[#f7faf7]"><Plus size={14} /> Invite candidate</Link>
+      <div className="mt-4 rounded-xl bg-[#f7faf7] p-3"><div className="flex items-center gap-2 text-[10px] font-semibold text-[#4c6854]"><ShieldCheck size={13} /> Fair review</div><p className="mt-1.5 text-[9px] leading-4 text-[#87938b]">Scores summarize evidence; a human makes the final decision.</p></div>
+    </aside>
+    <main className="min-w-0">
+      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
+        <div><p className="text-[9px] font-semibold uppercase tracking-[.16em] text-[#8e9b91]">Hiring workspace / Overview</p><h1 className="mt-1 text-[27px] font-semibold tracking-[-.05em] sm:text-[32px]">Candidate evidence</h1><p className="mt-1 text-[11px] text-[#7d8981]">Review the process, understanding, and context behind each assessment.</p></div>
+        <label className="relative block w-full sm:max-w-[270px]"><span className="sr-only">Search candidates</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search candidates or tasks" className="w-full rounded-full border border-[#e3e9e4] bg-white px-4 py-3 text-[11px] outline-none transition focus:border-[#91b99a] focus:ring-4 focus:ring-[#e8f4eb]" /></label>
+      </div>
+      <div aria-busy={loading} className="mt-5 grid grid-cols-2 gap-3 xl:grid-cols-4">
+        {[
+          { icon: Users, name: "Candidates", value: candidates.length, color: "bg-[#eef4ef] text-[#4b7f5a]" },
+          { icon: BadgeCheck, name: "Verified", value: verified, color: "bg-[#eaf5ed] text-[#4b815b]" },
+          { icon: CircleHelp, name: "Needs review", value: review, color: "bg-[#fff4df] text-[#a07431]" },
+          { icon: BarChart3, name: "Average score", value: `${averageScore}/100`, color: "bg-[#eef1f7] text-[#65749a]" },
+        ].map(({ icon: Icon, name: label, value, color }) => <div key={label} className="rounded-2xl border border-[#e6ece7] bg-white px-4 py-3.5 shadow-[0_6px_20px_#1c352808] sm:px-5">
+          <div className="flex items-center justify-between gap-2"><span className="text-[10px] font-medium text-[#78847c]">{label}</span><span className={`grid size-7 place-items-center rounded-lg ${color}`}><Icon size={14} /></span></div>
+          <div className="mt-2 text-[24px] font-semibold tracking-[-.05em] tabular-nums text-[#26372d]">{loading ? <span aria-label="Loading" className="inline-block h-7 w-10 animate-pulse rounded-lg bg-[#edf1ed]" /> : value}</div>
+        </div>)}
+      </div>
+      <section aria-busy={loading} className="mt-5 overflow-hidden rounded-[20px] border border-[#e6ece7] bg-white shadow-[0_8px_28px_#1c352808]">
+        <div className="flex flex-col justify-between gap-3 border-b border-[#edf0ed] px-5 py-4 sm:flex-row sm:items-center"><div><h2 className="text-[14px] font-semibold">Recent assessments</h2><p className="mt-1 text-[10px] text-[#8b978f]">Evidence is a guide for human review, never an automated hiring decision.</p></div><Link to="/assessment" className="inline-flex items-center justify-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[10px] font-semibold text-white hover:bg-[#28523d]"><Plus size={13} /> Invite a candidate</Link></div>
+        <div role="group" aria-label="Filter candidates by verdict" className="flex flex-wrap gap-2 border-b border-[#edf0ed] px-5 py-3">
+          {["All", "Verified skill", "Needs review", "Low confidence"].map((item) => <button key={item} type="button" onClick={() => setFilter(item)} aria-pressed={filter === item} className={`rounded-full border px-3.5 py-2 text-[10px] font-semibold transition ${filter === item ? "border-[#c9dfce] bg-[#edf6ef] text-[#457351]" : "border-[#e8ece8] bg-white text-[#7e8982] hover:bg-[#f8faf8]"}`}>{item}{item === "Low confidence" ? ` · ${lowConfidence}` : ""}</button>)}
+        </div>
+        {error && <p role="alert" className="border-b border-[#f2dbd8] bg-[#fff7f6] px-5 py-3 text-xs text-[#a34c47]">{error}</p>}
+        {loading && <div role="status" className="space-y-3 px-5 py-5"><span className="sr-only">Loading candidate assessments</span>{[0, 1, 2].map((row) => <div key={row} className="flex animate-pulse items-center gap-3 border-b border-[#f0f2f0] pb-4 last:border-0"><span className="size-9 rounded-full bg-[#edf1ed]" /><span className="h-3 w-36 rounded bg-[#edf1ed]" /><span className="ml-auto h-5 w-20 rounded-full bg-[#f2f4f2]" /></div>)}</div>}
+        {!loading && filtered.map((candidate) => <Link key={candidate.id} to={`/candidates/${candidate.id}`} className="group grid gap-3 border-t border-[#f0f2f0] px-5 py-4 transition hover:bg-[#fbfdfb] sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+          <div className="flex min-w-0 items-center gap-3"><span className="grid size-10 shrink-0 place-items-center rounded-full bg-[#edf4ee] text-[11px] font-semibold text-[#487453]">{candidate.name.split(" ").map((word) => word[0]).join("")}</span><div className="min-w-0"><div className="truncate text-[12px] font-semibold group-hover:text-[#39734d]">{candidate.name}</div><div className="mt-1 flex flex-wrap items-center gap-x-2 gap-y-1 text-[10px] text-[#8e9992]"><span>{candidate.role}</span><span>·</span><span>{candidate.task_variant || "Skills assessment"}</span><span>·</span><span>{candidate.status === "In progress" ? "In progress" : new Date(candidate.created_at).toLocaleDateString(undefined, { month: "short", day: "numeric" })}</span><span><VerdictTone verdict={candidate.verdict} /></span></div></div></div>
+          <div className="flex items-center justify-between gap-4 sm:justify-end"><ScoreRing score={candidate.score} size={48} /><span className="text-[10px] font-semibold text-[#477753] group-hover:underline">View report <ArrowRight className="ml-1 inline" size={12} /></span></div>
+        </Link>)}
+        {!loading && !filtered.length && !error && <div className="px-5 py-12 text-center text-[12px] text-[#8b978f]">No candidates match this search.</div>}
+      </section>
+    </main>
+  </div></PageFrame>;
+}
+
+function EvidenceCard({ title, icon: Icon, aside, children }: { title: string; icon: typeof Code2; aside?: ReactNode; children: ReactNode }) {
+  return <section className="rounded-[18px] border border-[#e6ece7] bg-white"><div className="flex items-center justify-between border-b border-[#eef1ee] px-4 py-3.5 sm:px-5"><h2 className="flex items-center gap-2 text-[12px] font-semibold"><span className="grid size-7 place-items-center rounded-lg bg-[#f0f5f1] text-[#558064]"><Icon size={14} /></span>{title}</h2>{aside}</div><div className="p-4 sm:p-5">{children}</div></section>;
+}
+
+function CandidateDetail() {
+  const { id = "" } = useParams();
+  const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [scoringConfig, setScoringConfig] = useState<Awaited<ReturnType<typeof api.scoringConfig>> | null>(null);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [activeTab, setActiveTab] = useState("Overview");
+  useEffect(() => {
+    Promise.all([api.candidate(id), api.scoringConfig()])
+      .then(([candidateResult, config]) => { setCandidate(candidateResult); setScoringConfig(config); })
+      .catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load candidate evidence."));
+    setActiveTab("Overview");
+  }, [id]);
+  if (error) return <PageFrame dashboard><main className="mx-auto max-w-3xl px-5 py-20"><p role="alert" className="rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</p><Link className="mt-4 inline-block text-sm text-[#4e7b5b]" to="/dashboard">Back to dashboard</Link></main></PageFrame>;
+  if (!candidate || !scoringConfig) return <PageFrame dashboard><main className="mx-auto max-w-3xl px-5 py-20 text-sm text-[#849087]">Loading candidate evidence…</main></PageFrame>;
+  const components = candidate.scoring_components || { viva: 0, process: 0, aiUsage: 75, liveCheck: 0, timeAndPaste: 0, aiText: 0 };
+  const vivaScore10 = components.viva / 10;
+  const verifiedPrompts = candidate.ai_prompts.filter((item) => item.verified).length;
+  const seededMistakes = candidate.ai_prompts.filter((item) => item.seeded_mistake).length;
+  const caughtMistakes = candidate.ai_prompts.filter((item) => item.seeded_mistake && (item.caught || item.edited_after)).length;
+  const editedAfterPrompts = candidate.ai_prompts.filter((item) => item.edited_after).length;
+  const elapsedAt = (time: string) => {
+    const [eventMinutes, seconds] = time.split(":").map(Number);
+    return (eventMinutes || 0) * 60 + (seconds || 0);
+  };
+  const activityBuckets = new Map<number, { minute: string; edits: number; pastes: number; tests: number; focus: number; changes: number }>();
+  candidate.events.forEach((event) => {
+    const minuteIndex = Math.floor(elapsedAt(event.time) / 60);
+    const bucket = activityBuckets.get(minuteIndex) || {
+      minute: `${minuteIndex}m`, edits: 0, pastes: 0, tests: 0, focus: 0, changes: 0,
+    };
+    if (event.type === "edit") bucket.edits += event.count;
+    else if (event.type === "paste") bucket.pastes += event.count;
+    else if (event.type === "run") bucket.tests += 1;
+    else if (event.type === "tab" || event.type === "blur") bucket.focus += 1;
+    else if (event.type === "requirement_change") bucket.changes += 1;
+    activityBuckets.set(minuteIndex, bucket);
+  });
+  const activityData = Array.from(activityBuckets.values()).sort((a, b) => Number.parseInt(a.minute) - Number.parseInt(b.minute));
+  const tabs = ["Overview", "Process replay", "Viva", "AI usage", "Live check", "Credential"];
+  const scoreRows = [
+    ["Viva understanding", components.viva, scoringConfig.weights.viva],
+    ["Process pattern", components.process, scoringConfig.weights.process],
+    ["AI usage quality", components.aiUsage, scoringConfig.weights.aiUsage],
+    ["Live skill check", components.liveCheck, scoringConfig.weights.liveCheck],
+    ["Time and paste behavior", components.timeAndPaste, scoringConfig.weights.timeAndPaste],
+    ["AI-text detection", 0, scoringConfig.weights.aiText],
+  ] as const;
+  const flagDetails = candidate.flag_details?.length ? candidate.flag_details : candidate.flags.map((evidence) => ({
+    key: "review-note", evidence, explanation: "Discuss this evidence alongside the rest of the assessment.", weak_signal: false,
+  }));
+  const verdictReason = candidate.verdict_reason || "The evidence should be considered as a whole; a human reviewer makes the final decision.";
+  const onCopy = async () => {
+    const url = `${window.location.origin}/credential/${candidate.id}`;
+    try { await navigator.clipboard.writeText(url); setCopied(true); window.setTimeout(() => setCopied(false), 1800); }
+    catch { setError("Could not copy the credential link. You can open the credential page and copy its URL."); }
+  };
+  return <PageFrame dashboard><main className="mx-auto max-w-[1240px] px-5 pb-12 pt-8 lg:px-8">
+    <Link to="/dashboard" className="inline-flex items-center gap-2 text-[11px] font-medium text-[#77847c] hover:text-[#385d44]"><ArrowLeft size={13} /> Candidate dashboard</Link>
+    <div className="mt-5 flex flex-col justify-between gap-4 rounded-[20px] border border-[#e6ece7] bg-white p-5 sm:flex-row sm:items-center sm:p-6">
+      <div className="flex items-center gap-4"><span className="grid size-12 place-items-center rounded-full bg-[#edf4ee] text-sm font-semibold text-[#487453]">{candidate.name.split(" ").map((word) => word[0]).join("")}</span><div><div className="flex flex-wrap items-center gap-2.5"><h1 className="text-[22px] font-semibold tracking-[-.04em]">{candidate.name}</h1><VerdictTone verdict={candidate.verdict} /></div><p className="mt-1 text-[11px] text-[#849087]">{candidate.role} <span className="mx-1.5 text-[#c4ccc6]">·</span>{candidate.email || "Email not provided"} <span className="mx-1.5 text-[#c4ccc6]">·</span>{candidate.task_variant || "Skills assessment"}</p></div></div>
+      <div className="flex items-center gap-4"><div className="flex items-center gap-3"><ScoreRing score={candidate.score} size={58} /><div><div className="text-[10px] text-[#8a968e]">Evidence score</div><div className="text-[12px] font-semibold">Weighted across signals</div></div></div>{candidate.credential_id && <button onClick={onCopy} className="inline-flex items-center gap-2 rounded-full border border-[#dce8df] px-3.5 py-2.5 text-[11px] font-semibold text-[#477753] hover:bg-[#f2f8f3]"><Copy size={13} />{copied ? "Copied" : "Copy credential link"}</button>}</div>
+    </div>
+    <div role="tablist" aria-label="Candidate evidence sections" className="mt-5 flex gap-1 overflow-x-auto rounded-2xl border border-[#e6ece7] bg-white p-1.5">
+      {tabs.map((tab) => <button key={tab} role="tab" aria-selected={activeTab === tab} onClick={() => setActiveTab(tab)} className={`shrink-0 rounded-xl px-4 py-2.5 text-[10px] font-semibold transition ${activeTab === tab ? "bg-[#1d3d2e] text-white" : "text-[#77847c] hover:bg-[#f5f8f5]"}`}>{tab}</button>)}
+    </div>
+
+    {activeTab === "Overview" && <div className="mt-4 grid gap-4 lg:grid-cols-[minmax(0,1.5fr)_minmax(280px,.8fr)]">
+      <div className="space-y-4">
+        <EvidenceCard title={`Final verdict: ${candidate.verdict}`} icon={ShieldCheck}>
+          <p className="text-[12px] leading-6 text-[#647168]">{verdictReason}</p>
+          <div className="mt-4 rounded-xl border border-[#e4ece5] bg-[#f7faf7] p-4"><div className="flex items-center gap-2 text-[11px] font-semibold text-[#4d7657]"><Shield size={14} /> Fairness by design</div><p className="mt-1.5 text-[10px] leading-5 text-[#7c8980]">No candidate is rejected on a single signal. A human reviewer makes the final decision; AI use and AI-text notes are never standalone evidence.</p></div>
+        </EvidenceCard>
+        <EvidenceCard title="Evidence flags" icon={Flag}>
+          {flagDetails.length ? <div className="space-y-3">{flagDetails.map((flag, index) => <div key={`${flag.key}-${index}`} className="rounded-xl border border-[#ece8dd] bg-[#fffdf8] p-3.5"><div className="flex items-center gap-2 text-[10px] font-semibold text-[#866b3d]"><Flag size={12} />{flag.key.replaceAll("-", " ")}</div><p className="mt-2 text-[10px] leading-5 text-[#675f50]"><strong>Evidence:</strong> {flag.evidence}</p><p className="mt-1 text-[10px] leading-5 text-[#818078]">{flag.explanation}</p></div>)}</div> : <div className="flex items-center gap-2 text-[11px] text-[#598165]"><CheckCircle2 size={15} />No evidence flags.</div>}
+        </EvidenceCard>
+      </div>
+      <EvidenceCard title="Scoring breakdown" icon={BarChart3}>
+        <div className="space-y-3">{scoreRows.map(([label, value, weight]) => <div key={label}><div className="mb-1.5 flex items-center justify-between gap-2 text-[10px]"><span className="font-medium text-[#647168]">{label}</span><span className="text-right text-[#929d95]">{Math.round(Number(weight) * 100)}% <strong className="ml-1 text-[#526158]">{value}</strong></span></div><div className="h-1.5 overflow-hidden rounded-full bg-[#edf1ed]"><div className="h-full rounded-full bg-[#72a67e]" style={{ width: `${value}%` }} /></div></div>)}</div>
+        <p className="mt-4 rounded-xl bg-[#f5f8f5] p-3 text-[10px] leading-5 text-[#819087]">AI-text analysis: <strong>0% weight</strong>. It is a weak style note only and may produce false positives, including for non-native English speakers.</p>
+      </EvidenceCard>
+    </div>}
+
+    {activeTab === "Process replay" && <div className="mt-4 space-y-4">
+      <EvidenceCard title="Activity over time" icon={BarChart3} aside={<span className="text-[10px] text-[#8c9890]">{candidate.events.length} events · {candidate.keystrokes} keypresses</span>}>
+        {activityData.length ? <div className="h-[260px] w-full" role="img" aria-label="Bar chart showing edit, paste, test, focus, and requirement-change activity by minute">
+          <Suspense fallback={<div role="status" className="grid h-full place-items-center text-[11px] text-[#829087]">Loading activity chart…</div>}><ActivityChart data={activityData} /></Suspense>
+        </div> : <p className="py-8 text-center text-[11px] text-[#929d95]">No activity events were recorded.</p>}
+      </EvidenceCard>
+      <EvidenceCard title="Process timeline" icon={Radio} aside={<span className="text-[10px] text-[#8c9890]">{Math.floor(candidate.duration_seconds / 60)} min · {candidate.events.length} events</span>}>
+        <div className="relative ml-2 space-y-0 before:absolute before:bottom-3 before:left-[11px] before:top-3 before:w-px before:bg-[#e3ebe5]">
+          {candidate.events.map((event, index) => {
+            const Icon = event.type === "paste" ? Upload : event.type === "tab" || event.type === "blur" ? Eye : event.type === "idle" ? Clock3 : event.type === "run" ? Code2 : event.type === "requirement_change" ? Flag : Code2;
+            const tone = event.type === "paste" ? "bg-[#fff2df] text-[#ad7931]" : event.type === "tab" || event.type === "blur" ? "bg-[#f0eff7] text-[#7c709b]" : event.type === "requirement_change" ? "bg-[#fff0ee] text-[#a75e54]" : "bg-[#edf5ef] text-[#4d805b]";
+            const gap = index ? elapsedAt(event.time) - elapsedAt(candidate.events[index - 1].time) : 0;
+            const gapLabel = gap >= 120 ? ` · ${Math.floor(gap / 60)}m gap` : "";
+            const eventLabel = event.type === "edit" ? "Edit" : event.type === "paste" ? "Paste" : event.type === "run" ? "Test attempt" : event.type === "requirement_change" ? "Requirement change" : event.type === "idle" ? "Idle period" : "Focus change";
+            return <div key={`${event.id || event.time}-${index}`} className="relative flex gap-3 pb-5 last:pb-0"><span className={`relative z-10 grid size-6 shrink-0 place-items-center rounded-full ring-4 ring-white ${tone}`}><Icon size={12} /></span><div className="flex min-w-0 flex-1 flex-wrap items-start justify-between gap-2"><div><div className="text-[11px] font-medium text-[#435349]">{event.detail}</div><div className="mt-1 text-[10px] text-[#96a098]">{eventLabel} · {event.count} {event.type === "paste" ? "lines" : event.type === "idle" ? "seconds" : "event"}{event.characters ? ` · ${event.characters} characters` : ""}{gapLabel}</div></div><span className="rounded-md bg-[#f4f6f4] px-2 py-1 font-mono text-[10px] text-[#7b8880]">{event.time}</span></div></div>;
+          })}
+        </div>
+        {!candidate.events.length && <p className="text-[11px] text-[#929d95]">No replay events recorded.</p>}
+      </EvidenceCard>
+    </div>}
+
+    {activeTab === "Viva" && <div className="mt-4 space-y-4">
+      <EvidenceCard title="Viva: understanding in their own words" icon={MessageSquareText} aside={<Pill tone={vivaScore10 >= 7.5 ? "green" : vivaScore10 >= 5 ? "amber" : "red"}>{vivaScore10.toFixed(1)}/10 average</Pill>}>
+        {candidate.viva.length ? <div className="space-y-4">{candidate.viva.map((item, index) => {
+          const score = item.score === null ? null : Number(item.score) > 10 ? Number(item.score) / 10 : Number(item.score);
+          return <div key={index} className="border-b border-[#f0f2f0] pb-4 last:border-0 last:pb-0"><div className="flex items-start justify-between gap-3"><p className="text-[11px] font-semibold leading-5 text-[#45554b]">{index + 1}. {item.question}</p><span className={`shrink-0 rounded-full px-2 py-1 text-[10px] font-semibold ${Number(score) >= 7.5 ? "bg-[#eaf5ed] text-[#4d805b]" : Number(score) >= 5 ? "bg-[#fff4df] text-[#9d712d]" : "bg-[#fceceb] text-[#a34c47]"}`}>{score === null ? "—" : score.toFixed(1)}/10</span></div><p className="mt-2 rounded-xl bg-[#fafbf9] p-3 text-[11px] leading-5 text-[#627168]">“{item.answer || "No answer recorded"}”</p>{item.feedback && <p className="mt-2 flex items-start gap-1.5 text-[10px] leading-4 text-[#849087]"><Sparkles size={11} className="mt-0.5 shrink-0 text-[#977fc0]" />{item.feedback}</p>}</div>;
+        })}</div> : <p className="text-[11px] text-[#89958d]">No viva answers recorded.</p>}
+      </EvidenceCard>
+    </div>}
+
+    {activeTab === "AI usage" && <div className="mt-4 space-y-4">
+      <EvidenceCard title="Assistant use: prompts and review" icon={Sparkles} aside={<Pill tone="gray">{candidate.ai_prompts.length} prompts</Pill>}>
+        <div className="mb-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+          {[["Prompts", candidate.ai_prompts.length], ["Verified", verifiedPrompts], ["Seeded mistakes caught", `${caughtMistakes}/${seededMistakes}`], ["Code improved after AI", editedAfterPrompts]].map(([label, value]) => <div key={String(label)} className="rounded-xl bg-[#f7faf7] p-3"><div className="text-[9px] text-[#8b978f]">{label}</div><div className="mt-1 text-[14px] font-semibold text-[#46584b]">{value}</div></div>)}
+        </div>
+        {candidate.ai_prompts.length ? <div className="space-y-3">{candidate.ai_prompts.map((item, index) => <div key={item.id || index} className="rounded-xl border border-[#eceaf4] bg-[#fcfbff] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8e879e]">Prompt {index + 1}</div><p className="mt-1.5 text-[11px] leading-5 text-[#615d77]">“{item.prompt}”</p>{item.response && <p className="mt-2 rounded-lg bg-white p-3 text-[10px] leading-5 text-[#727083]"><strong>Assistant response:</strong> {item.response}</p>}<div className="mt-3 flex flex-wrap gap-2 text-[9px] font-medium"><Pill tone={item.verified ? "green" : "gray"}>{item.verified ? "Verified by candidate" : "Not marked verified"}</Pill>{item.seeded_mistake && <Pill tone={item.caught || item.edited_after ? "green" : "amber"}>{item.caught || item.edited_after ? "Seeded mistake caught" : "Seeded mistake not caught"}</Pill>}</div><p className="mt-2 text-[10px] leading-4 text-[#8a9190]">{item.summary}</p></div>)}</div> : <p className="text-[11px] text-[#89958d]">No assistant prompts recorded.</p>}
+      </EvidenceCard>
+      <EvidenceCard title="AI-text style note" icon={CircleHelp}>
+        <p className="rounded-xl border border-[#e7e2d6] bg-[#fbf9f2] p-4 text-[11px] leading-6 text-[#786e59]"><strong>Weak signal, not used alone.</strong> {candidate.ai_text_note || "Response-length style observations may have false positives, including for non-native English speakers, and contribute 0% to the score."}</p>
+        <p className="mt-3 text-[10px] leading-5 text-[#87938b]">This observation is not evidence of AI authorship and must not be used by itself to judge a candidate.</p>
+      </EvidenceCard>
+    </div>}
+
+    {activeTab === "Live check" && <div className="mt-4">
+      <EvidenceCard title="Timed live skill check" icon={Code2} aside={<Pill tone={candidate.live_check && candidate.live_check.score >= 70 ? "green" : "amber"}>{candidate.live_check ? `${candidate.live_check.score}%` : "Not completed"}</Pill>}>
+        {candidate.live_check ? <div>
+          <div className="grid gap-2 sm:grid-cols-3 lg:grid-cols-5">
+            {[["Tests passed", `${candidate.live_check.passed}/${candidate.live_check.total}`], ["Test attempts", candidate.live_check.attempts], ["Time used", `${Math.floor(candidate.live_check.duration_seconds / 60)}m ${candidate.live_check.duration_seconds % 60}s`], ["Focus changes", candidate.live_check.focus_changes], ["Window blur events", candidate.live_check.blur_events || 0], ["Long idle periods", candidate.live_check.idle_periods?.length || 0]].map(([label, value]) => <div key={String(label)} className="rounded-xl bg-[#f7faf7] p-3"><div className="text-[9px] text-[#8b978f]">{label}</div><div className="mt-1 text-[12px] font-semibold text-[#46584b]">{value}</div></div>)}
+          </div>
+          <p className="mt-4 text-[11px] leading-5 text-[#647168]">Selected fix: <strong>{candidate.live_check.selected_fix === "null-prototype" ? "null-prototype accumulator" : candidate.live_check.selected_fix === "validate-key" ? "key validation" : "regular object accumulator"}</strong>. Requirement update: <strong>{candidate.live_check.requirement_change_seen ? "shown" : "not reached"}</strong>.</p>
+          <p className="mt-2 text-[10px] leading-5 text-[#849087]">Focus and timing are process notes, not standalone decisions. No video or audio was collected.</p>
+        </div> : <p className="text-[11px] text-[#89958d]">No live skill check evidence recorded.</p>}
+      </EvidenceCard>
+    </div>}
+
+    {activeTab === "Credential" && <div className="mt-4">
+      <EvidenceCard title="Credential" icon={BadgeCheck}>
+        {candidate.credential_id && candidate.verdict === "Verified skill" ? <div className="flex flex-col justify-between gap-4 rounded-2xl border border-[#dce9df] bg-[#f8fbf8] p-5 sm:flex-row sm:items-center"><div><Pill><BadgeCheck size={11} /> Verified skill</Pill><h2 className="mt-3 text-[18px] font-semibold">{candidate.name}</h2><p className="mt-1 text-[11px] text-[#78847c]">Skills: Code reasoning · Edge-case handling</p><p className="mt-1 font-mono text-[10px] text-[#89958d]">{candidate.credential_id}</p><Link to={`/credential/${candidate.id}`} className="mt-4 inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Open credential card <ExternalLink size={11} /></Link></div><CheckCircle2 className="text-[#4d8a5d]" size={28} /></div> : <div className="rounded-xl border border-[#ece7dc] bg-[#fbf8f1] p-4 text-[11px] leading-5 text-[#8a754f]">A public credential is issued only when the assessment reaches Verified skill. This candidate currently has no credential.</div>}
+      </EvidenceCard>
+      <EvidenceCard title="Submitted solution" icon={Code2}><pre className="scrollbar-thin overflow-auto rounded-xl bg-[#111b18] p-4 font-mono text-[11px] leading-6 text-[#c0d0c4]">{candidate.code}</pre></EvidenceCard>
+    </div>}
+  </main></PageFrame>;
+}
+
+function Verification() {
+  const [searchParams] = useSearchParams();
+  const queryCredentialId = searchParams.get("credentialId") || "";
+  const [credentialId, setCredentialId] = useState(queryCredentialId);
+  const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const verify = useCallback(async (value: string) => {
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api.verifyCredential(value);
+      setCandidate(result);
+    } catch (issue) {
+      setCandidate(null);
+      setError(issue instanceof Error ? issue.message : "Credential not found.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+  useEffect(() => {
+    if (queryCredentialId) {
+      setCredentialId(queryCredentialId);
+      void verify(queryCredentialId);
+    }
+  }, [queryCredentialId, verify]);
+  async function handleSubmit(event: FormEvent) {
+    event.preventDefault();
+    const trimmed = credentialId.trim();
+    if (!trimmed) {
+      setError("Enter a credential ID to verify.");
+      setCandidate(null);
+      return;
+    }
+    await verify(trimmed);
+  }
+
+  return <PageFrame><main className="mx-auto max-w-[820px] px-5 py-14 sm:py-18">
+    <div className="rounded-[28px] border border-[#e6ece7] bg-white p-6 shadow-[0_18px_60px_#17321b10] sm:p-9">
+      <div className="flex items-center justify-between gap-3"><div>
+        <Pill><ShieldCheck size={11} /> Public verification</Pill>
+        <h1 className="mt-4 text-[30px] font-semibold tracking-[-.05em]">Verify a SkillProof credential</h1>
+      </div><span className="grid size-11 place-items-center rounded-2xl bg-[#edf4ef] text-[#4d835d]"><BadgeCheck size={19} /></span></div>
+      <p className="mt-3 max-w-[620px] text-[13px] leading-6 text-[#758078]">Enter a credential ID to confirm whether the candidate has a verified SkillProof assessment on file.</p>
+      <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-3 sm:flex-row">
+        <input value={credentialId} onChange={(event) => setCredentialId(event.target.value)} placeholder="e.g. sp-8f31c4" className="w-full rounded-full border border-[#e3e9e4] bg-[#fafcfb] px-4 py-3 text-[13px] outline-none transition focus:border-[#8db7a0] focus:ring-4 focus:ring-[#e8f4eb]" />
+        <button disabled={loading} className="rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#a9b8b0]">{loading ? "Checking…" : "Verify"}</button>
+      </form>
+      {error && <p role="alert" className="mt-4 rounded-xl bg-[#fff5f3] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
+      {candidate && <div className="mt-6 rounded-2xl border border-[#e6ece7] bg-[#f8faf8] p-5">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <div className="text-[10px] font-semibold uppercase tracking-[.14em] text-[#7a8d82]">Verified record</div>
+            <h2 className="mt-2 text-[22px] font-semibold tracking-[-.04em] text-[#1d3327]">{candidate.name}</h2>
+          </div>
+          <Pill tone="green"><BadgeCheck size={10} /> Verified skill</Pill>
+        </div>
+        <div className="mt-4 grid gap-3 sm:grid-cols-3">
+          {[['Credential ID', candidate.credential_id || '—'], ['Score', `${candidate.score}/100`], ['Role', candidate.role]].map(([label, value]) => <div key={label} className="rounded-xl bg-white p-3"><div className="text-[9px] uppercase tracking-[.12em] text-[#8c9990]">{label}</div><div className="mt-1 text-[12px] font-semibold text-[#2d4138]">{value}</div></div>)}
+        </div>
+        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-[#e3eae4] bg-white p-3.5">
+          <div className="text-[11px] text-[#74827b]">Assessment published on {new Date(candidate.created_at).toLocaleDateString()}</div>
+          <Link to={`/credential/${candidate.id}`} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-3 py-2 text-[10px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">View public credential <ExternalLink size={11} /></Link>
+        </div>
+      </div>}
+    </div>
+  </main></PageFrame>;
+}
+
+function Credential() {
+  const { id = "" } = useParams();
+  const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [credential, setCredential] = useState<Awaited<ReturnType<typeof api.credential>>["credential"] | null>(null);
+  const [error, setError] = useState("");
+  const [copied, setCopied] = useState(false);
+  const [shared, setShared] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+  useEffect(() => {
+    api.candidate(id).then(async (candidateResult) => {
+      setCandidate(candidateResult);
+      if (candidateResult.credential_id) {
+        const result = await api.credential(candidateResult.credential_id);
+        setCredential(result.credential);
+      }
+    }).catch((issue) => setError(issue instanceof Error ? issue.message : "Credential not found."))
+      .finally(() => setLoaded(true));
+  }, [id]);
+  const credentialUrl = `${window.location.origin}/credential/${id}`;
+  const verifyUrl = credential ? `${window.location.origin}/verify?credentialId=${encodeURIComponent(credential.credential_id)}` : "";
+  async function copy() {
+    try { await navigator.clipboard.writeText(credentialUrl); setCopied(true); window.setTimeout(() => setCopied(false), 1500); }
+    catch { setError("Could not copy this link. Copy the page URL from your browser."); }
+  }
+  async function share() {
+    if (!navigator.share) {
+      await copy();
+      return;
+    }
+    try {
+      await navigator.share({ title: "SkillProof credential", text: `${candidate?.name || "Candidate"}'s verified SkillProof credential`, url: credentialUrl });
+      setShared(true);
+      window.setTimeout(() => setShared(false), 1500);
+    } catch (issue) {
+      if (issue instanceof Error && issue.name !== "AbortError") setError("Could not share this credential. Use Copy link instead.");
+    }
+  }
+  return <PageFrame><main className="mx-auto max-w-[760px] px-5 py-14 sm:py-20">
+    <div className="flex justify-center"><Logo /></div>
+    {error ? <div role="alert" className="mt-10 rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</div> : !loaded ? <p className="mt-12 text-center text-sm text-[#859188]">Verifying credential…</p> : !candidate?.credential_id || candidate.verdict !== "Verified skill" || !credential ? <div className="mt-10 rounded-2xl border border-[#e6ece7] bg-white p-8 text-center"><CircleHelp className="mx-auto text-[#ad8746]" /><h1 className="mt-3 text-xl font-semibold">Credential unavailable</h1><p className="mt-2 text-sm text-[#7c8980]">This assessment has not earned a verified credential.</p></div> : <div className="relative mt-10 overflow-hidden rounded-[28px] border border-[#dce9df] bg-white shadow-[0_20px_70px_#17321b12]">
+      <div className="absolute right-0 top-0 size-64 translate-x-20 -translate-y-20 rounded-full bg-[radial-gradient(circle,#e2f2e5_0%,transparent_70%)]" />
+      <div className="relative border-b border-[#eef2ee] px-7 py-6 sm:px-10"><div className="flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[.16em] text-[#77917d]">SkillProof credential</span><span className="grid size-10 place-items-center rounded-xl bg-[#eaf5ed] text-[#4d865b]"><BadgeCheck size={20} /></span></div></div>
+      <div className="relative px-7 py-8 sm:px-10 sm:py-10"><Pill><CheckCircle2 size={12} /> Verified skill</Pill><h1 className="mt-5 text-[32px] font-semibold tracking-[-.05em] sm:text-[40px]">{candidate.name}</h1><p className="mt-2 text-[14px] text-[#708077]">demonstrated understanding in a SkillProof assessment</p>
+        <div className="mt-8 grid gap-3 sm:grid-cols-3">{[["Skills verified", credential.skills.join(", ")], ["Issued", new Date(credential.issued_date).toLocaleDateString()], ["Assessment score", `${candidate.score} / 100`]].map(([label, value]) => <div key={label} className="rounded-xl bg-[#f7faf7] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8b9b8e]">{label}</div><div className="mt-1.5 text-[12px] font-semibold text-[#3d5043]">{value}</div></div>)}</div>
+        <div className="mt-6 flex flex-col gap-5 rounded-xl border border-[#e7eee8] p-4 sm:flex-row sm:items-center"><div className="shrink-0 rounded-lg bg-white p-2"><QRCodeSVG value={verifyUrl} size={132} level="M" title="Scan to verify this SkillProof credential" /></div><div><h2 className="text-[12px] font-semibold text-[#435349]">Verify this credential</h2><p className="mt-1 text-[10px] leading-5 text-[#78867d]">Scan the QR code or use the public verification page to confirm this credential ID.</p><p className="mt-3 font-mono text-[10px] text-[#718078]">ID: {credential.credential_id}</p><p className="mt-2 text-[10px] leading-5 text-[#78867d]">{credential.evidence_summary}</p></div></div>
+        <div className="mt-6 flex items-start gap-3 rounded-xl border border-[#e7eee8] p-4"><ShieldCheck size={16} className="mt-0.5 shrink-0 text-[#5a9367]" /><p className="text-[10px] leading-5 text-[#78867d]">Verified through a practical task, candidate-consented process evidence, and a viva about their own work. This credential confirms assessment participation and demonstrated understanding; it is not a guarantee of job performance.</p></div>
+        <div className="mt-7 flex flex-wrap items-center justify-between gap-3"><Link to={`/verify?credentialId=${encodeURIComponent(credential.credential_id)}`} className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Verify this credential <ExternalLink size={11} /></Link><div className="flex gap-2"><button onClick={copy} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-4 py-2.5 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]"><Copy size={13} />{copied ? "Copied" : "Copy link"}</button><button onClick={share} className="inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d]">{shared ? <Check size={13} /> : <ExternalLink size={13} />}{shared ? "Shared" : "Share"}</button></div></div>
+      </div>
+    </div>}
+    <p className="mt-6 text-center text-[10px] text-[#99a39b]"><Link to="/dashboard" className="hover:text-[#4c805a]">Back to hiring dashboard</Link></p>
+  </main></PageFrame>;
+}
+
+export default function App() {
+  const [isBooting, setIsBooting] = useState(true);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setIsBooting(false), 1700);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  if (isBooting) {
+    return <LoadingScreen />;
+  }
+
+  return <Routes>
+    <Route path="/" element={<Home />} />
+    <Route path="/assessment" element={<Assessment />} />
+    <Route path="/viva/:id" element={<Viva />} />
+    <Route path="/live-check/:id" element={<LiveCheckChallenge />} />
+    <Route path="/dashboard" element={<Dashboard />} />
+    <Route path="/verify" element={<Verification />} />
+    <Route path="/candidates/:id" element={<CandidateDetail />} />
+    <Route path="/credential/:id" element={<Credential />} />
+    <Route path="*" element={<Navigate to="/" replace />} />
+  </Routes>;
+}
