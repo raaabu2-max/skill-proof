@@ -1,7 +1,9 @@
 import type {
   Candidate,
+  AssessmentJourneyReport,
   CredentialDetails,
   LiveCheck,
+  McqQuestion,
   TaskVariant,
   TimelineEvent,
   TrackResult,
@@ -23,7 +25,7 @@ export const api = {
   candidates: () => request<Candidate[]>("/candidates"),
   candidate: (id: string) => request<Candidate>(`/candidates/${id}`),
   tracks: () => request<TracksCatalog>("/tracks"),
-  startTrackSession: (name: string, email: string, extraTime: boolean, track: string, domain: string) => request<{
+  startTrackSession: (name: string, email: string, extraTime: boolean, track: string, domain: string, journeyId?: string | null) => request<{
     candidate_id: string;
     session_id: string;
     track: string;
@@ -36,6 +38,7 @@ export const api = {
       candidate: { name, email, role: "Software Engineer", consent: true, extra_time: extraTime },
       track,
       domain,
+      ...(journeyId ? { journey_id: journeyId } : {}),
     }),
   }),
   startSession: (name: string, email: string, extraTime: boolean) => request<{
@@ -85,10 +88,18 @@ export const api = {
     name: string; email: string; code: string; consent: boolean; session_id?: string; events: Candidate["events"];
     ai_prompts: Candidate["ai_prompts"]; duration_seconds: number; keystrokes: number;
   }) => request<{ id: string; candidate: Candidate }>("/assessment", { method: "POST", body: JSON.stringify(data) }),
-  questions: (id: string, task?: string) => request<{ questions: VivaAnswer[] }>(`/candidates/${id}/questions`, {
-    method: "POST", body: JSON.stringify({ task }),
+  questions: (id: string, details: { task?: string; track: "skill" | "adapt" }) => request<{ questions: McqQuestion[] }>(`/candidates/${id}/questions`, {
+    method: "POST", body: JSON.stringify({ ...details, mcq: true }),
   }),
-  answer: (id: string, index: number, answer: string) => request<{ answer: VivaAnswer; score_10: number; reason: string }>(`/candidates/${id}/answer`, {
+  mcqQuestions: (id: string) => request<{ questions: McqQuestion[] }>(`/candidates/${id}/questions`),
+  answer: (id: string, index: number, answer: string) => request<{
+    answer: VivaAnswer;
+    score_10: number;
+    reason: string;
+    isCorrect: boolean;
+    correctOption: "A" | "B" | "C" | "D";
+    explanation: string;
+  }>(`/candidates/${id}/answer`, {
     method: "POST", body: JSON.stringify({ index, answer }),
   }),
   liveCheck: (id: string, result: Omit<LiveCheck, "score">) => request<{ live_check: LiveCheck }>(`/candidates/${id}/live-check`, {
@@ -96,6 +107,7 @@ export const api = {
   }),
   complete: (id: string) => request<Candidate>(`/candidates/${id}/complete`, { method: "POST" }),
   scoringConfig: () => request<{ weights: Record<string, number>; verdictThresholds: { verified: number; review: number }; lowConfidenceMinimumWeakSignals: number }>("/scoring-config"),
+  journey: (id: string) => request<AssessmentJourneyReport>(`/journeys/${encodeURIComponent(id)}`),
   verifyCredential: (credentialId: string) => request<Candidate>(`/verify/${encodeURIComponent(credentialId)}`),
   credential: (credentialId: string) => request<{ candidate: Candidate; credential: CredentialDetails }>(
     `/credentials/${encodeURIComponent(credentialId)}`,

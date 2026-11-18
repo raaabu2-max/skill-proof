@@ -26,6 +26,28 @@ export type VivaAnswer = {
   feedback: string;
 };
 
+export type McqOption = { id: "A" | "B" | "C" | "D"; text: string };
+
+export type McqQuestion = {
+  index: number;
+  scenario?: string;
+  question: string;
+  options: McqOption[];
+  submitted: boolean;
+  selectedOption?: McqOption["id"];
+  isCorrect?: boolean;
+  correctOption?: McqOption["id"];
+  explanation?: string;
+};
+
+export type AssessmentJourneyReport = {
+  journey_id: string;
+  candidate_name: string;
+  results: (TrackResult & { candidate_id: string })[];
+  combined_score: number;
+  verdict: Candidate["verdict"];
+};
+
 export type LiveCheck = {
   score: number;
   passed: number;
@@ -116,6 +138,7 @@ export type CredentialDetails = {
 export type Candidate = {
   id: string;
   session_id?: string | null;
+  journey_id?: string | null;
   track?: "problem-solver" | "skill" | "adapt";
   domain?: string;
   track_results?: TrackResult[];

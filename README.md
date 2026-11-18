@@ -1,6 +1,6 @@
-# SkillProof
+# FutureFit
 
-SkillProof is a hiring-assessment demo for understanding the work behind a submission: a practical task, a consent-based process replay, an AI viva, a timed debugging check, and a human-readable evidence report. AI activity is context only and is never a standalone rejection signal.
+FutureFit is a hiring-assessment demo for understanding the work behind a submission: a practical task, a consent-based process replay, an AI viva, a timed debugging check, and a human-readable evidence report. AI activity is context only and is never a standalone rejection signal.
 
 ## Requirements
 

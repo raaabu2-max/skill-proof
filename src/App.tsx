@@ -2,6 +2,7 @@ import { createContext, lazy, Suspense, useCallback, useContext, useEffect, useM
 import type { ComponentProps, FormEvent, ReactNode, RefObject } from "react";
 import Editor from "@monaco-editor/react";
 import { AnimatePresence, animate, motion, useInView, useMotionValue, useMotionValueEvent, useReducedMotion, useScroll, useTransform } from "framer-motion";
+import type { UseInViewOptions } from "framer-motion";
 import Lenis from "lenis";
 import { QRCodeSVG } from "qrcode.react";
 import ceoAvatar from "./assets/team-mira-solen.svg";
@@ -17,30 +18,34 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "./lib/api";
-import type { Candidate, TaskVariant, TimelineEvent, TrackDefinition, TrackResult, TracksCatalog, VivaAnswer } from "./types";
+import type { Candidate, McqQuestion, TaskVariant, TimelineEvent, TrackDefinition, TrackResult, TracksCatalog } from "./types";
 
 const ActivityChart = lazy(() => import("./ActivityChart"));
 
 type AssessmentTrack = "problem-solver" | "skill" | "adapt";
 type AssessmentProfile = { name: string; email: string; extraTime: boolean };
 type AssessmentJourney = {
+  journeyId: string | null;
   tracks: AssessmentTrack[];
   currentIndex: number;
   profile: AssessmentProfile | null;
   active: boolean;
+  scores: Partial<Record<AssessmentTrack, number>>;
 };
 type AssessmentFlow = {
   journey: AssessmentJourney;
   startSingle: (track: AssessmentTrack) => void;
   startFull: () => void;
   rememberProfile: (profile: AssessmentProfile) => void;
-  advance: () => AssessmentTrack | null;
+  advance: (completedTrack: AssessmentTrack, score: number) => AssessmentTrack | null;
 };
 const emptyAssessmentJourney: AssessmentJourney = {
+  journeyId: null,
   tracks: [],
   currentIndex: 0,
   profile: null,
   active: false,
+  scores: {},
 };
 const AssessmentFlowContext = createContext<AssessmentFlow | null>(null);
 
@@ -92,10 +97,43 @@ function checksForWork(track: AssessmentTrack, domain: string, value: string, va
   }
   if (track === "adapt") {
     const isPractical = domain === "marketing" || domain === "accounting";
+    const changedRequirementHandled = domain === "javascript"
+      ? /unknown|missing|null|fallback|n\/a/i.test(text)
+      : domain === "marketing"
+        ? /budget|30\s*%|30 percent|audience|objective|performance/i.test(text)
+        : /late|source|evidence|period|transaction|adjust/i.test(text);
     return [
       value.trim().length > 20,
       isPractical ? /\b(plan|reconcile|budget|transaction|audience|evidence)\b/i.test(value) : /\b(function|return|select|def)\b/i.test(value),
-      !requirementSeen || (domain === "javascript" ? /unknown|missing|null|fallback/i.test(text) : /budget|30%|late|source|evidence|updated/i.test(text)),
+      requirementSeen && changedRequirementHandled,
+    ];
+  }
+  if (track === "skill") {
+    if (domain === "javascript" && variant?.field) {
+      const fieldPattern = new RegExp(`(?:\\.${variant.field}\\b|\\[\\s*[\\"']${variant.field}[\\"']\\s*\\])`, "i");
+      const createsGroups = /\b(push|set|map|group)\b|\?\?=/.test(text);
+      const handlesMissing = /missing|unknown|undefined|null|object\.create\s*\(\s*null\s*\)|new map|hasown/i.test(text);
+      return [fieldPattern.test(value), createsGroups, handlesMissing];
+    }
+    if (domain === "python") return [
+      /def\s+clean_contacts\s*\(/i.test(value),
+      /name|email/i.test(text) && /strip|lower|normalize|clean/i.test(text),
+      /missing|duplicate|valid|invalid|preserv/i.test(text),
+    ];
+    if (domain === "sql") return [
+      /\bselect\b/i.test(value) && /\bfrom\b/i.test(value),
+      /count\s*\(\s*distinct\s+customer_id\s*\)/i.test(value),
+      /group\s+by/i.test(value) && /cohort_month/i.test(value),
+    ];
+    if (domain === "marketing") return [
+      /audience/i.test(text) && /channel/i.test(text),
+      /budget/i.test(text) && /split|allocat|percent|\$/i.test(text),
+      /measure|metric|conversion|outcome|baseline/i.test(text),
+    ];
+    if (domain === "accounting") return [
+      /statement|transaction/i.test(text),
+      /discrepanc|adjustment/i.test(text) && /source|evidence|document/i.test(text),
+      /opening|closing|balance/i.test(text),
     ];
   }
   return [
@@ -130,7 +168,7 @@ function trackSignals(candidate: Candidate, liveCheck: number, explanation = "")
 function Logo({ small = false }: { small?: boolean }) {
   return <Link to="/" className="brand-link flex items-center gap-2.5 font-semibold tracking-tight">
     <span className="brand-mark grid size-9 place-items-center rounded-xl"><ShieldCheck size={19} strokeWidth={2.2} /></span>
-    {!small && <span className="text-[17px]">skillproof<span className="brand-period">.</span></span>}
+    {!small && <span className="text-[17px]">futurefit<span className="brand-period">.</span></span>}
   </Link>;
 }
 
@@ -223,13 +261,13 @@ function LoadingScreen() {
         />
         <div className="loading-shield"><ShieldCheck size={39} strokeWidth={1.5} /></div>
       </div>
-      <div className="loading-brand">skillproof<span>.</span></div>
+      <div className="loading-brand">futurefit<span>.</span></div>
       <p className="loading-copy">Secure assessment workspace</p>
       <div className="loading-progress-row">
         <div
           className="loading-bar"
           role="progressbar"
-          aria-label="Loading SkillProof"
+          aria-label="Loading FutureFit"
           aria-valuemin={0}
           aria-valuemax={100}
           aria-valuenow={progress}
@@ -296,10 +334,11 @@ function ScrollEffects() {
 }
 
 type HowStep = { number: string; icon: typeof ClipboardCheck; title: string; text: string; color: string };
+type CenterMargin = NonNullable<UseInViewOptions["margin"]>;
 
 function StepTimelineItem({ step }: { step: HowStep }) {
   const ref = useRef<HTMLDivElement | null>(null);
-  const [centerMargin, setCenterMargin] = useState("-180px 0px -180px 0px");
+  const [centerMargin, setCenterMargin] = useState<CenterMargin>("-180px 0px -180px 0px");
   const isActive = useInView(ref, { margin: centerMargin, amount: 0.15 });
   const reduceMotion = useReducedMotion() === true;
   const Icon = step.icon;
@@ -308,7 +347,7 @@ function StepTimelineItem({ step }: { step: HowStep }) {
     const updateCenterMargin = () => {
       const centerBand = Math.min(160, Math.round(window.innerHeight * 0.18));
       const inset = Math.round((window.innerHeight - centerBand) / 2);
-      setCenterMargin(`-${inset}px 0px -${inset}px 0px`);
+      setCenterMargin(`-${inset}px 0px -${inset}px 0px` as CenterMargin);
     };
     updateCenterMargin();
     window.addEventListener("resize", updateCenterMargin);
@@ -447,7 +486,7 @@ function BeforeAfterSection({ sectionRef }: { sectionRef: RefObject<HTMLElement 
         animate={isInView ? { opacity: 1, x: 0 } : undefined}
         transition={{ duration: reduceMotion ? 0.2 : 0.54, delay: reduceMotion ? 0 : 0.08, ease: "easeOut" }}
       >
-        <span className="comparison-kicker">WITH SKILLPROOF</span>
+        <span className="comparison-kicker">WITH FUTUREFIT</span>
         <h3>A fuller view of real skill</h3>
         <ul>{afterItems.map((item) => <li key={item}><Check size={14} aria-hidden="true" />{item}</li>)}</ul>
       </motion.article>
@@ -460,7 +499,7 @@ function FinalCta() {
   const isInView = useInView(ref, { once: true, amount: 0.35 });
   const reduceMotion = useReducedMotion() === true;
 
-  return <section className="final-cta-section" aria-label="Get started with SkillProof">
+  return <section className="final-cta-section" aria-label="Get started with FutureFit">
     <motion.div
       ref={ref}
       className="final-cta-banner"
@@ -578,7 +617,7 @@ function HeroProductPreview({ mode }: { mode: HeroPreviewMode }) {
   return <div className="product-window hero-preview-window">
     <div className="window-topbar">
       <div className="window-dots"><i /><i /><i /></div>
-      <span>SKILLPROOF / CANDIDATE WORKSPACE</span>
+      <span>FUTUREFIT / CANDIDATE WORKSPACE</span>
       <span className="window-secure"><ShieldCheck size={12} /> PRIVATE</span>
     </div>
     <div className="product-content">
@@ -616,10 +655,10 @@ function HeroProductPreview({ mode }: { mode: HeroPreviewMode }) {
           <div className="product-heading"><div><span className="product-kicker">{modeLabels[mode]}</span><h3>Assessment complete</h3></div><span className="task-status"><i /> VERIFIED</span></div>
           <div className="preview-credential">
             <span className="preview-credential-icon"><ShieldCheck size={27} /></span>
-            <div><strong>SkillProof credential</strong><small>Practical skill · Process · Viva</small></div>
+            <div><strong>FutureFit credential</strong><small>Practical skill · Process · Viva</small></div>
             <span className="preview-credential-check"><CheckCircle2 size={17} /></span>
           </div>
-          <div className="product-foot"><span><BadgeCheck size={13} /> Shareable evidence record</span><span>SP-2048</span></div>
+          <div className="product-foot"><span><BadgeCheck size={13} /> Shareable evidence record</span><span>FF-2048</span></div>
         </>}
       </div>
     </div>
@@ -714,7 +753,7 @@ function Home() {
               animate={{ opacity: 1, y: 0 }}
               transition={{ duration: reduceMotion ? 0.2 : 0.65, delay: reduceMotion ? 0 : 0.96, ease: "easeOut" }}
             >See the thinking.<br />Meet the <span>real talent.</span></motion.h1>
-            <p>Great hiring is more than a perfect answer. SkillProof brings the process, reasoning, and practical skill into one clear picture — with AI treated as a tool, not a verdict.</p>
+            <p>Great hiring is more than a perfect answer. FutureFit brings the process, reasoning, and practical skill into one clear picture — with AI treated as a tool, not a verdict.</p>
             <div className="hero-actions">
               <Link to="/assessments" className="hero-primary primary-glow">Try the live demo <ArrowRight size={16} /></Link>
               <a href="#how-it-works" className="hero-secondary">Explore the platform <ArrowDownRight size={16} /></a>
@@ -764,10 +803,10 @@ function Home() {
           </motion.div>
         </ScrollReveal>
       </section>
-      <section className="brand-strip" aria-label="SkillProof principles">
+      <section className="brand-strip" aria-label="FutureFit principles">
         <ScrollReveal><span>BUILT FOR BETTER HIRING</span><strong>Human-first</strong><i /> <strong>Evidence-led</strong><i /> <strong>AI-aware</strong><i /> <strong>Fair by design</strong></ScrollReveal>
       </section>
-      <section className="stats-strip" aria-label="SkillProof at a glance">
+      <section className="stats-strip" aria-label="FutureFit at a glance">
         <ScrollReveal className="stats-grid">
           <CountUpStat value={6} label="Assessment signals" delay={0} />
           <CountUpStat value={4} label="Assessment stages" delay={0.1} />
@@ -798,7 +837,7 @@ function Home() {
           <div className="fair-step"><span>01</span><div><strong>Clear from the start</strong><small>Candidates know what is collected and why.</small></div><BadgeCheck size={18} /></div>
           <div className="fair-step"><span>02</span><div><strong>AI is never the judge</strong><small>Human review stays at the center.</small></div><ShieldCheck size={18} /></div>
           <div className="fair-step"><span>03</span><div><strong>Evidence, not surveillance</strong><small>No camera, microphone, or browsing history.</small></div><Eye size={18} /></div>
-          <div className="principles-card-foot"><span><i /> TRUST BY DESIGN</span><span>SKILLPROOF · 2026</span></div>
+          <div className="principles-card-foot"><span><i /> TRUST BY DESIGN</span><span>FUTUREFIT · 2026</span></div>
         </ScrollReveal>
       </section>
       <section ref={teamRef} id="team" className="team-section" aria-labelledby="team-heading">
@@ -821,7 +860,7 @@ function Home() {
       </section>
       <FinalCta />
     </main>
-    <footer className="landing-footer"><ScrollReveal><Logo /><span>Clear evidence. Fairer conversations. Better hiring.</span><span>© {new Date().getFullYear()} SkillProof</span></ScrollReveal></footer>
+    <footer className="landing-footer"><ScrollReveal><Logo /><span>Clear evidence. Fairer conversations. Better hiring.</span><span>© {new Date().getFullYear()} FutureFit</span></ScrollReveal></footer>
   </div>;
 }
 
@@ -953,11 +992,83 @@ function FullAssessmentRoute() {
   return <PageFrame><main className="mx-auto max-w-3xl px-5 py-20 text-sm text-[#849087]">Preparing your full assessment…</main></PageFrame>;
 }
 
+function evidenceScore(evidence: Record<string, unknown>, key: string) {
+  const value = evidence[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function FullAssessmentReport() {
+  const { id = "" } = useParams();
+  const [report, setReport] = useState<Awaited<ReturnType<typeof api.journey>> | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    api.journey(id).then((value) => { if (active) setReport(value); })
+      .catch((issue) => { if (active) setError(issue instanceof Error ? issue.message : "Could not load the full assessment report."); });
+    return () => { active = false; };
+  }, [id]);
+
+  if (error) return <PageFrame><main className="mx-auto max-w-3xl px-5 py-16"><p role="alert" className="rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</p></main></PageFrame>;
+  if (!report) return <PageFrame><main className="mx-auto max-w-3xl px-5 py-16 text-sm text-[#849087]">Loading your full assessment report…</main></PageFrame>;
+
+  const resultByTrack = new Map(report.results.map((result) => [result.track, result]));
+  const strengths = report.results.filter((result) => result.score >= 70);
+  const improvements = report.results.filter((result) => result.score < 70);
+  const performanceFeedback = report.combined_score >= 85
+    ? "Your results show consistent evidence across the three assessment sections. Keep extending that performance to new tasks and scenarios."
+    : report.combined_score >= 70
+      ? "Your results show a solid overall foundation, with a few section-specific opportunities to strengthen consistency."
+      : "Your results identify clear areas to practice. Use the section feedback and recommendations to target the next improvement.";
+  const learningRecommendations: Partial<Record<AssessmentTrack, string>> = {
+    "problem-solver": "Practice explaining root causes before changing code, then verify each fix with a focused test.",
+    skill: "Review the viva explanations and strengthen the practical task's edge-case handling and verification.",
+    adapt: "Revisit the scenario feedback and practice mapping task changes to an inclusive, evidence-led response.",
+  };
+
+  return <PageFrame><main className="mx-auto max-w-[850px] px-5 py-12 sm:py-16">
+    <div className="rounded-[24px] border border-[#e5ebe6] bg-white p-7 shadow-[0_12px_50px_#17321b0a] sm:p-10">
+      <div className="text-center"><span className="mx-auto grid size-12 place-items-center rounded-2xl bg-[#eaf5ed] text-[#4c805a]"><CheckCircle2 size={24} /></span>
+        <p className="mt-5 text-[10px] font-semibold uppercase tracking-[.15em] text-[#7b927f]">Full assessment complete</p>
+        <h1 className="app-page-title mt-2 text-[30px] font-semibold tracking-[-.05em]">Your performance report</h1>
+        <p className="mt-2 text-[12px] text-[#738078]">{report.candidate_name} · Problem Solver, Skill, and Adapt</p>
+        <div className="mt-5 text-[58px] font-semibold tracking-[-.07em] text-[#315d3e]">{report.combined_score}<span className="text-[18px] text-[#91a196]">/100</span></div>
+        <p className="text-[10px] text-[#89958d]">Combined score calculated using the configured track weights.</p>
+        <p className="mx-auto mt-3 max-w-[560px] rounded-xl bg-[#f7faf7] px-4 py-3 text-[10px] leading-5 text-[#6f7d73]"><strong className="text-[#435349]">Performance feedback:</strong> {performanceFeedback}</p>
+      </div>
+      <div className="mt-8 grid gap-3 sm:grid-cols-3">
+        {(["problem-solver", "skill", "adapt"] as const).map((track) => {
+          const result = resultByTrack.get(track);
+          const practical = evidenceScore(result?.evidence || {}, track === "skill" ? "skill_practical_score" : "adapt_practical_score");
+          const viva = evidenceScore(result?.evidence || {}, track === "skill" ? "skill_viva_score" : "adapt_scenario_score");
+          return <div key={track} className="rounded-2xl border border-[#e5ebe6] bg-[#fafcfb] p-4">
+            <h2 className="text-[11px] font-semibold text-[#47584d]">{trackLabels[track]}</h2>
+            <div className="mt-2 text-[30px] font-semibold tracking-[-.05em] text-[#315d3e]">{result?.score ?? "—"}<span className="ml-1 text-[12px] text-[#91a196]">/100</span></div>
+            {track !== "problem-solver" && <div className="mt-2 space-y-1 text-[9px] text-[#7f8c83]">
+              <p>{track === "skill" ? "Practical task" : "Adaptation checks"}: {practical === null ? "—" : `${practical}/100`}</p>
+              <p>{track === "skill" ? "MCQ viva" : "Workplace scenarios"}: {viva === null ? "—" : `${viva}/100`}</p>
+            </div>}
+          </div>;
+        })}
+      </div>
+      <div className="mt-7 grid gap-4 sm:grid-cols-2">
+        <section className="rounded-2xl border border-[#e5ebe6] p-4"><h2 className="text-[11px] font-semibold text-[#435349]">Strengths</h2>
+          {strengths.length ? <ul className="mt-2 space-y-2 text-[10px] leading-5 text-[#6f7d73]">{strengths.map((result) => <li key={result.track}><strong className="text-[#4c805a]">{trackLabels[result.track] || result.track} ({result.score}/100):</strong> {result.score >= 85 ? "Strong evidence across this section." : "A solid result with room to deepen consistency."}</li>)}</ul> : <p className="mt-2 text-[10px] leading-5 text-[#89958d]">No section reached the current 70/100 strength marker; use the feedback and recommendations below to guide practice.</p>}
+        </section>
+        <section className="rounded-2xl border border-[#e5ebe6] p-4"><h2 className="text-[11px] font-semibold text-[#435349]">Areas to improve</h2>
+          {improvements.length ? <ul className="mt-2 space-y-2 text-[10px] leading-5 text-[#6f7d73]">{improvements.map((result) => <li key={result.track}><strong className="text-[#9b6b22]">{trackLabels[result.track] || result.track} ({result.score}/100):</strong> {learningRecommendations[result.track as AssessmentTrack]}</li>)}</ul> : <p className="mt-2 text-[10px] leading-5 text-[#89958d]">All sections reached the current 70/100 strength marker. Continue practicing with varied tasks and scenarios.</p>}
+        </section>
+      </div>
+      <div className="mt-6 flex flex-wrap justify-center gap-3"><Link to="/assessments" className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white hover:bg-[#28523d]">Back to assessments <ArrowRight size={14} /></Link>
+        <Link to="/hr" className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-5 py-3 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">View hiring dashboard <ArrowRight size={14} /></Link></div>
+    </div>
+  </main></PageFrame>;
+}
+
 function AssessmentTrackRoute() {
   const { track: routeTrack } = useParams();
   const location = useLocation();
-  const navigate = useNavigate();
   const flow = useAssessmentFlow();
+  const freshStartHandled = useRef(false);
   const validTrack = isAssessmentTrack(routeTrack);
   const track = validTrack ? routeTrack : null;
   const isCurrentJourneyStep = Boolean(track && flow.journey.active &&
@@ -966,12 +1077,13 @@ function AssessmentTrackRoute() {
   useEffect(() => {
     if (!track) return;
     if (location.state?.freshAssessment) {
+      if (freshStartHandled.current) return;
+      freshStartHandled.current = true;
       flow.startSingle(track);
-      navigate(location.pathname, { replace: true, state: null });
       return;
     }
     if (!isCurrentJourneyStep) flow.startSingle(track);
-  }, [flow.startSingle, isCurrentJourneyStep, location.pathname, location.state, navigate, track]);
+  }, [flow.startSingle, isCurrentJourneyStep, location.state, track]);
 
   if (!track) return <Navigate to="/assessments" replace />;
   return <Assessment key={track} track={track} />;
@@ -996,9 +1108,39 @@ function TrackResultScreen() {
   const result = candidate.track_results?.find((item) => item.track === track);
   const nextTrack = flow.journey.tracks[flow.journey.currentIndex + 1];
   const continueJourney = () => {
-    const next = flow.advance();
+    if (!result) return;
+    const next = flow.advance(track, result.score);
     if (next) navigate(`/assessments/${next}`, { state: { fullSequence: true } });
-    else navigate("/assessments");
+    else if (flow.journey.tracks.length > 1 && flow.journey.journeyId) {
+      navigate(`/assessments/full/results/${flow.journey.journeyId}`);
+    } else navigate("/assessments");
+  };
+  const practicalKey = track === "skill" ? "skill_practical_score" : "adapt_practical_score";
+  const vivaKey = track === "skill" ? "skill_viva_score" : "adapt_scenario_score";
+  const practicalScore = result ? evidenceScore(result.evidence, practicalKey) : null;
+  const vivaScore = result ? evidenceScore(result.evidence, vivaKey) : null;
+  const signalLabels: Record<string, string> = {
+    viva: track === "adapt" ? "Workplace scenario decisions" : "Viva answers",
+    process: "Work process and iteration",
+    aiUsage: "Evaluation of AI assistance",
+    liveCheck: track === "adapt" ? "Practical adaptation checks" : "Practical task checks",
+    timeAndPaste: "Time and work evidence",
+  };
+  const strengths = result ? Object.entries(result.signals).filter(([, score]) => score >= 70) : [];
+  const gaps = result ? Object.entries(result.signals).filter(([, score]) => score < 70) : [];
+  const performanceFeedback = result?.score !== undefined
+    ? result.score >= 85
+      ? "Strong evidence across this section; continue applying the same care to new tasks."
+      : result.score >= 70
+        ? "A solid result, with opportunities to make the evidence more consistent."
+        : "The evidence points to specific skills worth practicing before the next assessment."
+    : "The result is still being prepared.";
+  const recommendations: Record<string, string> = {
+    viva: track === "adapt" ? "Review the scenario explanations and practice comparing options against evidence and inclusion." : "Review the explanations for missed questions and practice explaining the task's key edge cases.",
+    liveCheck: "Revisit the practical requirements, make a targeted improvement, and verify it with focused checks.",
+    process: "Use smaller iterations and record what each verification step confirms.",
+    aiUsage: "When using assistance, verify suggestions against the task and trusted sources before applying them.",
+    timeAndPaste: "Allow time for independent review and a final edge-case check.",
   };
 
   return <PageFrame><main className="mx-auto max-w-[760px] px-5 py-12 sm:py-16">
@@ -1007,6 +1149,19 @@ function TrackResultScreen() {
       <p className="mt-5 text-[10px] font-semibold uppercase tracking-[.15em] text-[#7b927f]">{nextTrack ? "Track complete" : "Assessment complete"}</p>
       <h1 className="app-page-title mt-2 text-[30px] font-semibold tracking-[-.05em]">{track === "problem-solver" ? "Problem Solver" : track === "adapt" ? "Adapt" : "Skill"} result</h1>
       {result ? <><div className="mt-5 text-[54px] font-semibold tracking-[-.07em] text-[#315d3e]">{result.score}<span className="text-[18px] text-[#91a196]">/100</span></div><p className="mt-2 text-[12px] text-[#738078]">{result.domain} · Your evidence has been saved.</p></> : <p className="mt-4 text-[12px] text-[#738078]">Your result is being prepared. Refresh this page if it does not appear.</p>}
+      {result && <p className="mx-auto mt-3 max-w-[560px] rounded-xl bg-[#f7faf7] px-4 py-3 text-left text-[10px] leading-5 text-[#6f7d73]"><strong className="text-[#435349]">Performance feedback:</strong> {performanceFeedback}</p>}
+      {result && track !== "problem-solver" && <div className="mx-auto mt-6 grid max-w-[540px] gap-3 text-left sm:grid-cols-2">
+        <div className="rounded-xl border border-[#e7ece8] bg-[#fafcfb] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8c9990]">{track === "skill" ? "Practical task score" : "Adaptation checks"}</div><div className="mt-1 text-[22px] font-semibold text-[#315d3e]">{practicalScore ?? "—"}<span className="ml-1 text-[10px] text-[#91a196]">/100</span></div></div>
+        <div className="rounded-xl border border-[#e7ece8] bg-[#fafcfb] p-4"><div className="text-[9px] font-semibold uppercase tracking-[.12em] text-[#8c9990]">{track === "skill" ? "MCQ viva score" : "Workplace scenario score"}</div><div className="mt-1 text-[22px] font-semibold text-[#315d3e]">{vivaScore ?? "—"}<span className="ml-1 text-[10px] text-[#91a196]">/100</span></div></div>
+      </div>}
+      {result && <div className="mx-auto mt-6 grid max-w-[650px] gap-3 text-left sm:grid-cols-2">
+        <section className="rounded-xl border border-[#e7ece8] p-4"><h2 className="text-[10px] font-semibold text-[#435349]">Strengths</h2>
+          {strengths.length ? <ul className="mt-2 space-y-1.5 text-[9px] leading-4 text-[#77847c]">{strengths.map(([key, score]) => <li key={key}><strong className="text-[#4c805a]">{signalLabels[key] || key} ({score}/100).</strong> Evidence is at or above the current 70/100 strength marker.</li>)}</ul> : <p className="mt-2 text-[9px] leading-4 text-[#89958d]">Use the learning actions below to build stronger evidence in this section.</p>}
+        </section>
+        <section className="rounded-xl border border-[#e7ece8] p-4"><h2 className="text-[10px] font-semibold text-[#435349]">Areas to improve</h2>
+          {gaps.length ? <ul className="mt-2 space-y-1.5 text-[9px] leading-4 text-[#77847c]">{gaps.map(([key, score]) => <li key={key}><strong className="text-[#9b6b22]">{signalLabels[key] || key} ({score}/100):</strong> {recommendations[key] || "Review the related task evidence and practice a focused improvement."}</li>)}</ul> : <p className="mt-2 text-[9px] leading-4 text-[#89958d]">No section signal is below the current 70/100 practice marker.</p>}
+        </section>
+      </div>}
       {track === "skill" && candidate.viva.length > 0 && <div className="mt-7 space-y-2 text-left">
         <h2 className="text-[11px] font-semibold text-[#56645b]">AI viva · scored answers</h2>
         {candidate.viva.map((answer, index) => <div key={`${answer.question}-${index}`} className="rounded-xl border border-[#e7ece8] bg-[#fafcfb] px-4 py-3">
@@ -1015,9 +1170,10 @@ function TrackResultScreen() {
         </div>)}
       </div>}
       <div className="mt-7 flex flex-wrap justify-center gap-3">
-        {nextTrack && <button onClick={continueJourney} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white hover:bg-[#28523d]">Continue to next track <ArrowRight size={14} /></button>}
+        {nextTrack && <button disabled={!result} onClick={continueJourney} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">Continue to next track <ArrowRight size={14} /></button>}
         <Link to={`/candidates/${candidate.id}`} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-5 py-3 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">View evidence report <ArrowRight size={14} /></Link>
-        {!nextTrack && <Link to="/assessments" className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-5 py-3 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">Back to assessments <ArrowRight size={14} /></Link>}
+        {!nextTrack && flow.journey.tracks.length > 1 && flow.journey.journeyId && result && <button onClick={continueJourney} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[11px] font-semibold text-white hover:bg-[#28523d]">View full report <ArrowRight size={14} /></button>}
+        {!nextTrack && (flow.journey.tracks.length <= 1 || !flow.journey.journeyId) && <Link to="/assessments" className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-5 py-3 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]">Back to assessments <ArrowRight size={14} /></Link>}
       </div>
     </div>
   </main></PageFrame>;
@@ -1275,8 +1431,8 @@ function Assessment({ track }: { track: AssessmentTrack }) {
       const flushed = await flushEvents();
       if (!flushed || eventQueue.current.length) throw new Error("Your activity timeline could not be saved. Please try submitting again.");
       const saved = await api.submitAssessment({ name, email, code: codeRef.current, consent: true, session_id: sessionId, events, ai_prompts: prompts, duration_seconds: elapsed, keystrokes: keypresses.current });
-      if (track === "skill") {
-        await api.questions(saved.id, taskVariant?.description || codeRef.current);
+      if (track === "skill" || track === "adapt") {
+        await api.questions(saved.id, { track, task: taskVariant?.description || codeRef.current });
         navigate(`/viva/${saved.id}`);
       } else {
         const testScore = testResults?.length
@@ -1305,7 +1461,7 @@ function Assessment({ track }: { track: AssessmentTrack }) {
     finally { setSubmitting(false); }
   }
   const startSession = useCallback(async (candidateName: string, candidateEmail: string, extraTime: boolean) => {
-    const session = await api.startTrackSession(candidateName, candidateEmail, extraTime, track, domain);
+    const session = await api.startTrackSession(candidateName, candidateEmail, extraTime, track, domain, flow.journey.journeyId);
     setError("");
     flow.rememberProfile({ name: candidateName, email: candidateEmail, extraTime });
     setName(candidateName);
@@ -1388,6 +1544,10 @@ function Assessment({ track }: { track: AssessmentTrack }) {
           {consent && <span role="timer" title={`${time} remaining`} aria-label={`${time} remaining`} className="inline-flex items-center gap-1.5 rounded-full border border-[#e4eae5] bg-white px-3 py-1.5 text-[11px] tabular-nums text-[#65736a]"><Clock3 size={13} />{time}<span className="hidden sm:inline">left</span></span>}
         </div>
       </div>
+      {flow.journey.tracks.length > 1 && <section aria-label="Full assessment progress" className="mb-4 rounded-2xl border border-[#e5ebe6] bg-white px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-2 text-[9px] font-semibold text-[#7e8b82]"><span>Full assessment · section {flow.journey.currentIndex + 1} of 3</span><span>{trackLabels[track]}</span></div>
+        <div className="mt-2 flex gap-2">{flow.journey.tracks.map((journeyTrack, index) => <div key={`${journeyTrack}-${index}`} className="h-1.5 flex-1 overflow-hidden rounded-full bg-[#e6ece7]"><div className={`h-full transition-all ${flow.journey.scores[journeyTrack] !== undefined ? "bg-[#69a579]" : index === flow.journey.currentIndex ? "bg-[#a6c8ad]" : "bg-transparent"}`} style={{ width: flow.journey.scores[journeyTrack] !== undefined ? "100%" : index === flow.journey.currentIndex ? "45%" : "0%" }} /></div>)}</div>
+      </section>}
       {requirementUpdate && <div role="status" className="requirement-banner mb-4 rounded-2xl border border-[#f0dfbd] bg-[#fff9eb] px-5 py-3.5 text-[12px] leading-5 text-[#82652e]"><strong>Requirement update:</strong> {requirementUpdate}</div>}
       <div className={`grid items-start gap-4 ${track === "adapt" ? "xl:grid-cols-[270px_minmax(0,1fr)_300px]" : "xl:grid-cols-[270px_minmax(0,1fr)]"}`}>
         <aside className="rounded-[20px] border border-[#e5ebe6] bg-white p-5 shadow-[0_6px_25px_#17321b08]">
@@ -1465,71 +1625,172 @@ function Assessment({ track }: { track: AssessmentTrack }) {
 }
 
 function Viva() {
+  const flow = useAssessmentFlow();
   const { id = "" } = useParams();
   const navigate = useNavigate();
-  const [questions, setQuestions] = useState<VivaAnswer[]>([]);
+  const [candidate, setCandidate] = useState<Candidate | null>(null);
+  const [questions, setQuestions] = useState<McqQuestion[]>([]);
   const [current, setCurrent] = useState(0);
-  const [answer, setAnswer] = useState("");
+  const [selectedOption, setSelectedOption] = useState<"A" | "B" | "C" | "D" | "">("");
   const [busy, setBusy] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [lastFeedback, setLastFeedback] = useState<{ score: number; reason: string } | null>(null);
+  const [completed, setCompleted] = useState(false);
   useEffect(() => {
-    api.candidate(id).then((candidate) => {
-      if (candidate.viva.length) setQuestions(candidate.viva);
-      else api.questions(id).then((result) => setQuestions(result.questions)).catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load viva."));
-    }).catch((issue) => setError(issue instanceof Error ? issue.message : "Could not load viva."));
+    let active = true;
+    const load = async () => {
+      try {
+        const candidateResult = await api.candidate(id);
+        let result = await api.mcqQuestions(id);
+        if (!result.questions.length) {
+          const track = candidateResult.track === "adapt" ? "adapt" : "skill";
+          result = await api.questions(id, { track, task: candidateResult.task_variant || candidateResult.code });
+        }
+        if (!active) return;
+        setCandidate(candidateResult);
+        setQuestions(result.questions);
+        const firstUnanswered = result.questions.findIndex((question) => !question.submitted);
+        const index = firstUnanswered >= 0 ? firstUnanswered : Math.max(0, result.questions.length - 1);
+        setCurrent(index);
+        setSelectedOption(result.questions[index]?.selectedOption || "");
+      } catch (issue) {
+        if (active) setError(issue instanceof Error ? issue.message : "Could not load viva.");
+      } finally {
+        if (active) setLoading(false);
+      }
+    };
+    void load();
+    return () => { active = false; };
   }, [id]);
   const active = questions[current];
+
   async function submitAnswer(event: FormEvent) {
     event.preventDefault();
-    if (!active || !answer.trim()) return;
+    if (!active || !selectedOption || active.submitted) return;
     setBusy(true);
     setError("");
     try {
-      const result = await api.answer(id, current, answer);
-      const next = questions.map((item, index) => index === current ? result.answer : item);
-      setQuestions(next);
-      setLastFeedback({ score: result.score_10, reason: result.reason });
-      setAnswer("");
-      if (current + 1 < next.length) setCurrent(current + 1);
-      else {
-        const candidate = await api.candidate(id);
-        if (candidate.session_id && isAssessmentTrack(candidate.track)) {
-          const liveCheck = candidate.code.trim() ? Math.round(checksForWork("skill", candidate.domain || "javascript", candidate.code, null, false).filter(Boolean).length / 3 * 100) : 0;
-          const signals = trackSignals(candidate, liveCheck);
-          await api.submitTrackResult(candidate.session_id, {
-            track: candidate.track,
-            domain: candidate.domain || "javascript",
-            task_variant: candidate.task_variant || "",
-            signals,
-            evidence: {
-              viva: next.map((item) => ({ question: item.question, score_10: item.score === null ? null : item.score / 10, reason: item.feedback })),
-              domain: candidate.domain || "javascript",
-            },
-          });
-          navigate(`/assessments/result/${id}`);
-        } else {
-          navigate(`/live-check/${id}`);
-        }
-      }
+      const result = await api.answer(id, current, selectedOption);
+      setQuestions((items) => items.map((item, index) => index === current ? {
+        ...item,
+        submitted: true,
+        selectedOption,
+        isCorrect: result.isCorrect,
+        correctOption: result.correctOption,
+        explanation: result.explanation,
+      } : item));
     } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not save your answer."); }
     finally { setBusy(false); }
   }
+
+  async function finishViva() {
+    if (!candidate || questions.some((question) => !question.submitted) || completed) return;
+    setBusy(true);
+    setError("");
+    try {
+      const savedCandidate = await api.candidate(id);
+      if (!savedCandidate.session_id || !isAssessmentTrack(savedCandidate.track) || savedCandidate.track === "problem-solver") {
+        navigate(`/live-check/${id}`);
+        return;
+      }
+      const taskVariant = (await api.task(savedCandidate.session_id)).task_variant;
+      const requirement = savedCandidate.track === "adapt"
+        ? await api.requirementChange(savedCandidate.session_id)
+        : null;
+      const taskChecks = checksForWork(savedCandidate.track, savedCandidate.domain || "javascript", savedCandidate.code,
+        taskVariant, Boolean(requirement?.acknowledged));
+      const practicalScore = Math.round(taskChecks.filter(Boolean).length / Math.max(1, taskChecks.length) * 100);
+      const vivaScore = Math.round(savedCandidate.viva.reduce((sum, answer) => sum + (answer.score || 0), 0) /
+        Math.max(1, savedCandidate.viva.length));
+      const signals = trackSignals(savedCandidate, practicalScore);
+      signals.viva = vivaScore;
+      const track = savedCandidate.track;
+      await api.submitTrackResult(savedCandidate.session_id, {
+        track,
+        domain: savedCandidate.domain || "javascript",
+        task_variant: savedCandidate.task_variant || "",
+        signals,
+        evidence: {
+          practical_score: practicalScore,
+          mcq_score: vivaScore,
+          ...(track === "skill" ? { skill_practical_score: practicalScore, skill_viva_score: vivaScore } : {
+            adapt_practical_score: practicalScore,
+            adapt_scenario_score: vivaScore,
+            requirement_change_seen: Boolean(requirement?.acknowledged),
+          }),
+          task_checks: taskChecks,
+          task_check_count: taskChecks.length,
+          mcq_answers: questions.map((question) => ({
+            scenario: question.scenario,
+            question: question.question,
+            selected_option: question.selectedOption,
+            correct_option: question.correctOption,
+            is_correct: question.isCorrect,
+            explanation: question.explanation,
+          })),
+          domain: savedCandidate.domain || "javascript",
+        },
+      });
+      setCompleted(true);
+      navigate(`/assessments/result/${id}`);
+    } catch (issue) { setError(issue instanceof Error ? issue.message : "Could not save the assessment results."); }
+    finally { setBusy(false); }
+  }
+
+  function nextQuestion() {
+    if (!active?.submitted) return;
+    if (current + 1 < questions.length) {
+      setCurrent(current + 1);
+      setSelectedOption(questions[current + 1].selectedOption || "");
+    } else {
+      void finishViva();
+    }
+  }
+
+  const isAdapt = candidate?.track === "adapt";
+  const correctText = active?.correctOption ? active.options.find((option) => option.id === active.correctOption)?.text : "";
+  const answeredCount = questions.filter((question) => question.submitted).length;
+
+  if (loading) return <PageFrame><main className="mx-auto max-w-3xl px-5 py-20 text-sm text-[#849087]">Preparing task-specific questions…</main></PageFrame>;
+
   return <PageFrame><main className="mx-auto max-w-[850px] px-5 py-10 sm:py-14">
-    <Link to="/assessment" className="inline-flex items-center gap-2 text-[12px] font-medium text-[#718078] hover:text-[#375b43]"><ArrowLeft size={14} /> Back to task</Link>
+    <Link to="/assessments" className="inline-flex items-center gap-2 text-[12px] font-medium text-[#718078] hover:text-[#375b43]"><ArrowLeft size={14} /> Back to assessments</Link>
     <div className="mt-8 rounded-[24px] border border-[#e5ebe6] bg-white p-6 shadow-[0_12px_50px_#17321b0a] sm:p-9">
-      <div className="flex items-start justify-between"><div><Pill><Sparkles size={11} /> AI viva</Pill><h1 className="app-page-title mt-4 text-[30px] font-semibold tracking-[-.045em]">Talk us through your thinking.</h1><p className="mt-2 max-w-[560px] text-[13px] leading-6 text-[#748078]">A few short questions about the code you just wrote. Your answers help reviewers understand your reasoning, not your ability to memorize definitions.</p></div><span className="hidden size-11 place-items-center rounded-2xl bg-[#eef4ef] text-[#548164] sm:grid"><BrainCircuit size={21} /></span></div>
-      <div className="mt-7 flex items-center gap-2">{questions.map((_, index) => <div key={index} className={`h-1.5 flex-1 rounded-full ${index <= current ? "bg-[#5a9a6d]" : "bg-[#e8ede9]"}`} />)}</div>
-      <div className="mt-2 flex justify-between text-[10px] font-medium text-[#95a098]"><span>Question {questions.length ? current + 1 : 0} of {questions.length || 5}</span><span>About {Math.max(1, Math.ceil(((questions.length || 5) - current) * 0.4))} min remaining</span></div>
-      {lastFeedback && <div role="status" className="mt-4 rounded-xl border border-[#e5ebe6] bg-[#f7faf7] px-4 py-3 text-[11px] leading-5 text-[#65736a]"><strong className="text-[#3f704c]">Previous answer: {lastFeedback.score}/10.</strong> {lastFeedback.reason}</div>}
+      <div className="flex items-start justify-between"><div><Pill><Sparkles size={11} /> {isAdapt ? "Adapt scenarios" : "AI viva"}</Pill><h1 className="app-page-title mt-4 text-[30px] font-semibold tracking-[-.045em]">{isAdapt ? "Choose the strongest workplace response." : "Show what you know about your task."}</h1><p className="mt-2 max-w-[600px] text-[13px] leading-6 text-[#748078]">{isAdapt ? "Work through realistic scenarios on automation, human–AI collaboration, inclusive workplaces, and workforce planning." : "Task-specific questions about the work you just completed. Select one answer, submit it, then review the explanation."}</p></div><span className="hidden size-11 place-items-center rounded-2xl bg-[#eef4ef] text-[#548164] sm:grid"><BrainCircuit size={21} /></span></div>
+      {candidate && flow.journey.tracks.length > 1 && <div className="mt-5 rounded-xl border border-[#e7ece8] bg-[#fafcfb] p-3"><div className="flex items-center justify-between text-[9px] font-semibold text-[#7e8b82]"><span>Full assessment · {flow.journey.currentIndex + 1} of 3</span><span>{trackLabels[candidate.track || "skill"]}</span></div><div className="mt-2 h-1.5 overflow-hidden rounded-full bg-[#e6ece7]"><div className="h-full rounded-full bg-[#69a579]" style={{ width: `${((flow.journey.currentIndex + 1) / 3) * 100}%` }} /></div></div>}
+      <div className="mt-7 flex items-center gap-2" aria-label="Question progress">{questions.map((question, index) => <div key={index} className={`h-1.5 flex-1 rounded-full ${question.submitted ? "bg-[#5a9a6d]" : index === current ? "bg-[#a6c8ad]" : "bg-[#e8ede9]"}`} />)}</div>
+      <div className="mt-2 flex justify-between text-[10px] font-medium text-[#95a098]"><span>Question {questions.length ? current + 1 : 0} of {questions.length}</span><span>{answeredCount} answered</span></div>
       <form onSubmit={submitAnswer} className="mt-7">
         <div className="rounded-2xl border border-[#e7ece8] bg-[#fafbf9] p-5 sm:p-6">
-          {active ? <><div className="text-[10px] font-semibold uppercase tracking-[.12em] text-[#7b8f80]">Question {current + 1}</div><h2 className="mt-2 text-[19px] font-semibold leading-7 tracking-[-.02em]">{active.question}</h2></> : <div className="flex items-center gap-2 py-4 text-sm text-[#758178]"><span className="size-2 animate-pulse rounded-full bg-[#68a57a]" />Preparing questions for your code…</div>}
-          <label htmlFor="viva-answer" className="mt-5 block text-[10px] font-semibold text-[#87938b]">Your answer</label>
-          <textarea id="viva-answer" value={answer} onChange={(event) => setAnswer(event.target.value)} disabled={!active || busy} placeholder="Take a moment to explain your reasoning…" rows={5} className="mt-2 w-full resize-y rounded-xl border border-[#e3e9e4] bg-white p-4 text-[13px] leading-6 outline-none transition placeholder:text-[#a3ada6] focus:border-[#81af8c] focus:ring-4 focus:ring-[#e7f2e9] disabled:opacity-60" />
+          {active ? <>
+            <div className="text-[10px] font-semibold uppercase tracking-[.12em] text-[#7b8f80]">Question {current + 1}</div>
+            {active.scenario && <div className="mt-3 rounded-xl border border-[#e8ece8] bg-white px-4 py-3 text-[11px] leading-5 text-[#68766d]"><strong className="text-[#4c805a]">Scenario</strong><p className="mt-1">{active.scenario}</p></div>}
+            <h2 className="mt-3 text-[19px] font-semibold leading-7 tracking-[-.02em]">{active.question}</h2>
+            <fieldset className="mt-5 space-y-2" disabled={active.submitted || busy}>
+              <legend className="mb-2 text-[10px] font-semibold text-[#87938b]">Choose one answer</legend>
+              {active.options.map((option) => {
+                const isSelected = (active.submitted ? active.selectedOption : selectedOption) === option.id;
+                const isCorrect = active.submitted && active.correctOption === option.id;
+                const isIncorrectSelection = active.submitted && isSelected && !active.isCorrect;
+                return <label key={option.id} className={`flex cursor-pointer items-start gap-3 rounded-xl border px-4 py-3 text-[11px] leading-5 transition ${isCorrect ? "border-[#a8d1b0] bg-[#f0f8f1] text-[#3d7049]" : isIncorrectSelection ? "border-[#e8bdb8] bg-[#fff5f3] text-[#9c4d47]" : isSelected ? "border-[#83ae8d] bg-[#f2f8f3] text-[#41594a]" : "border-[#e6ebe7] bg-white text-[#68766d] hover:border-[#b8cbbb]"}`}>
+                  <input type="radio" name="mcq-answer" value={option.id} checked={isSelected} onChange={() => setSelectedOption(option.id)} className="mt-1 accent-[#477e55]" />
+                  <span className="grid size-5 shrink-0 place-items-center rounded-full bg-[#eef3ef] text-[9px] font-semibold text-[#607568]">{option.id}</span>
+                  <span>{option.text}</span>
+                </label>;
+              })}
+            </fieldset>
+            {active.submitted && <div role="status" className={`mt-4 rounded-xl border px-4 py-3 text-[11px] leading-5 ${active.isCorrect ? "border-[#d7e9da] bg-[#f2f8f3] text-[#577160]" : "border-[#f0dfbd] bg-[#fff9eb] text-[#82652e]"}`}>
+              <strong>{active.isCorrect ? "Correct." : `Not quite. The correct answer is ${active.correctOption}${correctText ? `: ${correctText}` : "."}`}</strong>
+              <p className="mt-1">{active.explanation}</p>
+            </div>}
+          </> : <div className="flex items-center gap-2 py-4 text-sm text-[#758178]">No questions are available for this assessment.</div>}
         </div>
         {error && <p role="alert" className="mt-3 rounded-xl bg-[#fff4f2] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
-        <div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-[11px] text-[#89958d]">Your answer is scored for demonstrated understanding.</p><button disabled={!active || !answer.trim() || busy} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{busy ? "Reviewing…" : current + 1 === questions.length ? "Finish viva" : "Next question"}<ArrowRight size={14} /></button></div>
+        <div className="mt-5 flex flex-wrap items-center justify-between gap-3"><p className="text-[11px] text-[#89958d]">{active?.submitted ? "Your answer and explanation have been saved." : "The correct answer is shown after you submit."}</p>
+          {active?.submitted
+            ? <button type="button" disabled={busy || current + 1 === questions.length && questions.some((question) => !question.submitted)} onClick={nextQuestion} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{current + 1 === questions.length ? busy ? "Saving results…" : "View results" : "Next question"}<ArrowRight size={14} /></button>
+            : <button disabled={!active || !selectedOption || busy} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#aab8ad]">{busy ? "Saving answer…" : "Submit answer"}<ArrowRight size={14} /></button>}
+        </div>
       </form>
     </div>
     <div className="mt-4 flex items-center justify-center gap-2 text-[10px] text-[#98a29b]"><LockKeyhole size={12} />Your answers are shared with the hiring team for this assessment only.</div>
@@ -1639,7 +1900,7 @@ function LiveCheckChallenge() {
         requirement_change_seen: requirementChanged,
       });
       const complete = await api.complete(id);
-      const nextTrack = flow.advance();
+      const nextTrack = flow.advance("problem-solver", complete.track_results?.find((result) => result.track === "problem-solver")?.score ?? complete.score);
       if (nextTrack) navigate(`/assessments/${nextTrack}`, { state: { fullSequence: true } });
       else navigate(`/candidates/${complete.id}`);
     } catch (issue) {
@@ -1727,7 +1988,7 @@ function VerdictTone({ verdict }: { verdict: Candidate["verdict"] }) {
 }
 
 function ScoreRing({ score, size = 68 }: { score: number; size?: number }) {
-  return <div className="relative grid shrink-0 place-items-center rounded-full" style={{ width: size, height: size, background: `conic-gradient(#4e9666 ${Math.max(0, Math.min(score, 100)) * 3.6}deg, #e9eee9 0deg)` }}>
+  return <div className="relative grid shrink-0 place-items-center rounded-full" style={{ width: size, height: size, background: `conic-gradient(#4195d0 ${Math.max(0, Math.min(score, 100)) * 3.6}deg, #24435f 0deg)` }}>
     <div className="grid place-items-center rounded-full bg-white" style={{ width: size - 7, height: size - 7 }}><span className="text-[18px] font-semibold tracking-tight text-[#23362a]">{score}<span className="text-[9px] text-[#94a098]">%</span></span></div>
   </div>;
 }
@@ -1752,9 +2013,9 @@ function trackPassed(result: TrackResult | undefined) {
 
 function TrackScoreRing({ result, track }: { result?: TrackResult; track: string }) {
   const score = result?.score;
-  const color = score === undefined ? "#b9c3bc" : trackPassed(result) ? "#4e9666" : score < 45 ? "#be6b62" : "#b58b47";
+  const color = score === undefined ? "#819bb4" : trackPassed(result) ? "#4195d0" : score < 45 ? "#be6b62" : "#b58b47";
   return <div className="flex min-w-[54px] flex-col items-center gap-1" title={`${trackLabels[track]}: ${score === undefined ? "No score yet" : `${score}/100`}`}>
-    <div aria-label={`${trackLabels[track]} score ${score === undefined ? "not available" : `${score} out of 100`}`} className="relative grid size-9 place-items-center rounded-full" style={{ background: `conic-gradient(${color} ${score === undefined ? 0 : Math.max(0, Math.min(score, 100)) * 3.6}deg, #e9eee9 0deg)` }}>
+    <div aria-label={`${trackLabels[track]} score ${score === undefined ? "not available" : `${score} out of 100`}`} className="relative grid size-9 place-items-center rounded-full" style={{ background: `conic-gradient(${color} ${score === undefined ? 0 : Math.max(0, Math.min(score, 100)) * 3.6}deg, #24435f 0deg)` }}>
       <span className="grid size-[29px] place-items-center rounded-full bg-white text-[9px] font-semibold tabular-nums text-[#34483a]">{score === undefined ? "—" : score}</span>
     </div>
     <span className="text-center text-[8px] leading-3 text-[#869188]">{trackLabels[track]}</span>
@@ -2122,11 +2383,11 @@ function Verification() {
     <div className="rounded-[28px] border border-[#e6ece7] bg-white p-6 shadow-[0_18px_60px_#17321b10] sm:p-9">
       <div className="flex items-center justify-between gap-3"><div>
         <Pill><ShieldCheck size={11} /> Public verification</Pill>
-        <h1 className="app-page-title mt-4 text-[30px] font-semibold tracking-[-.05em]">Verify a SkillProof credential</h1>
+        <h1 className="app-page-title mt-4 text-[30px] font-semibold tracking-[-.05em]">Verify a FutureFit credential</h1>
       </div><span className="grid size-11 place-items-center rounded-2xl bg-[#edf4ef] text-[#4d835d]"><BadgeCheck size={19} /></span></div>
-      <p className="mt-3 max-w-[620px] text-[13px] leading-6 text-[#758078]">Enter a credential ID to confirm whether the candidate has a verified SkillProof assessment on file.</p>
+      <p className="mt-3 max-w-[620px] text-[13px] leading-6 text-[#758078]">Enter a credential ID to confirm whether the candidate has a verified FutureFit assessment on file.</p>
       <form onSubmit={handleSubmit} className="mt-6 flex flex-col gap-3 sm:flex-row">
-        <input value={credentialId} onChange={(event) => setCredentialId(event.target.value)} placeholder="e.g. sp-8f31c4" className="w-full rounded-full border border-[#e3e9e4] bg-[#fafcfb] px-4 py-3 text-[13px] outline-none transition focus:border-[#8db7a0] focus:ring-4 focus:ring-[#e8f4eb]" />
+        <input value={credentialId} onChange={(event) => setCredentialId(event.target.value)} placeholder="e.g. FF-8f31c4" className="w-full rounded-full border border-[#e3e9e4] bg-[#fafcfb] px-4 py-3 text-[13px] outline-none transition focus:border-[#8db7a0] focus:ring-4 focus:ring-[#e8f4eb]" />
         <button disabled={loading} className="primary-glow rounded-full bg-[#1d3d2e] px-5 py-3 text-[12px] font-semibold text-white hover:bg-[#28523d] disabled:bg-[#a9b8b0]">{loading ? "Checking…" : "Verify"}</button>
       </form>
       {error && <p role="alert" className="mt-4 rounded-xl bg-[#fff5f3] px-4 py-3 text-xs text-[#a34c47]">{error}</p>}
@@ -2188,7 +2449,7 @@ function Credential() {
       return;
     }
     try {
-      await navigator.share({ title: "SkillProof credential", text: `${candidate?.name || "Candidate"}'s verified SkillProof credential`, url: credentialUrl });
+      await navigator.share({ title: "FutureFit credential", text: `${candidate?.name || "Candidate"}'s verified FutureFit credential`, url: credentialUrl });
       setShared(true);
       window.setTimeout(() => setShared(false), 1500);
     } catch (issue) {
@@ -2199,8 +2460,8 @@ function Credential() {
     <div className="flex justify-center"><Logo /></div>
     {error ? <div role="alert" className="mt-10 rounded-xl bg-[#fff5f3] p-4 text-sm text-[#a34c47]">{error}</div> : !loaded ? <p className="mt-12 text-center text-sm text-[#859188]">Verifying credential…</p> : !candidate?.credential_id || candidate.verdict !== "Verified skill" || !credential ? <div className="mt-10 rounded-2xl border border-[#e6ece7] bg-white p-8 text-center"><CircleHelp className="mx-auto text-[#ad8746]" /><h1 className="app-page-title mt-3 text-xl font-semibold">Credential unavailable</h1><p className="mt-2 text-sm text-[#7c8980]">This assessment has not earned a verified credential.</p></div> : <div className="relative mt-10 overflow-hidden rounded-[28px] border border-[#dce9df] bg-white shadow-[0_20px_70px_#17321b12]">
       <div className="absolute right-0 top-0 size-64 translate-x-20 -translate-y-20 rounded-full bg-[radial-gradient(circle,#e2f2e5_0%,transparent_70%)]" />
-      <div className="relative border-b border-[#eef2ee] px-7 py-6 sm:px-10"><div className="flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[.16em] text-[#77917d]">SkillProof credential</span><span className="grid size-10 place-items-center rounded-xl bg-[#eaf5ed] text-[#4d865b]"><BadgeCheck size={20} /></span></div></div>
-      <div className="relative px-7 py-8 sm:px-10 sm:py-10"><Pill verified><CheckCircle2 size={12} /> Verified skill</Pill><h1 className="app-page-title mt-5 text-[32px] font-semibold tracking-[-.05em] sm:text-[40px]">{candidate.name}</h1><p className="mt-2 text-[14px] text-[#708077]">demonstrated understanding in a SkillProof assessment</p>
+      <div className="relative border-b border-[#eef2ee] px-7 py-6 sm:px-10"><div className="flex items-center justify-between"><span className="text-[10px] font-semibold uppercase tracking-[.16em] text-[#77917d]">FutureFit credential</span><span className="grid size-10 place-items-center rounded-xl bg-[#eaf5ed] text-[#4d865b]"><BadgeCheck size={20} /></span></div></div>
+      <div className="relative px-7 py-8 sm:px-10 sm:py-10"><Pill verified><CheckCircle2 size={12} /> Verified skill</Pill><h1 className="app-page-title mt-5 text-[32px] font-semibold tracking-[-.05em] sm:text-[40px]">{candidate.name}</h1><p className="mt-2 text-[14px] text-[#708077]">demonstrated understanding in a FutureFit assessment</p>
         <div className="mt-8 grid gap-3 sm:grid-cols-2">{[
           ["Domain verified", verifiedDomains.join(", ") || domainLabels[candidate.domain || ""] || "Not recorded"],
           ["Date issued", new Date(credential.issued_date).toLocaleDateString()],
@@ -2214,7 +2475,7 @@ function Credential() {
             : <span className="text-[10px] text-[#78867d]">Track-level evidence is not available for this credential.</span>}</div>
           <p className="mt-3 text-[10px] leading-5 text-[#78867d]">{credential.evidence_summary}</p>
         </div>
-        <div className="mt-6 flex flex-col gap-5 rounded-xl border border-[#e7eee8] p-4 sm:flex-row sm:items-center"><div className="qr-code-panel shrink-0 rounded-lg bg-white p-2"><QRCodeSVG value={verifyUrl} size={132} level="M" title="Scan to verify this SkillProof credential" /></div><div><h2 className="text-[12px] font-semibold text-[#435349]">Verify this credential</h2><p className="mt-1 text-[10px] leading-5 text-[#78867d]">Scan the QR code or use the public verification page to confirm this credential ID.</p><p className="mt-3 text-[10px] text-[#78867d]">Skills: {credential.skills.join(", ")}</p></div></div>
+        <div className="mt-6 flex flex-col gap-5 rounded-xl border border-[#e7eee8] p-4 sm:flex-row sm:items-center"><div className="qr-code-panel shrink-0 rounded-lg bg-white p-2"><QRCodeSVG value={verifyUrl} size={132} level="M" title="Scan to verify this FutureFit credential" /></div><div><h2 className="text-[12px] font-semibold text-[#435349]">Verify this credential</h2><p className="mt-1 text-[10px] leading-5 text-[#78867d]">Scan the QR code or use the public verification page to confirm this credential ID.</p><p className="mt-3 text-[10px] text-[#78867d]">Skills: {credential.skills.join(", ")}</p></div></div>
         <div className="mt-6 flex items-start gap-3 rounded-xl border border-[#e7eee8] p-4"><ShieldCheck size={16} className="mt-0.5 shrink-0 text-[#5a9367]" /><p className="text-[10px] leading-5 text-[#78867d]">This credential summarizes passed track evidence and verified domains. It documents assessment performance; it is not a guarantee of job performance.</p></div>
         <div className="mt-7 flex flex-wrap items-center justify-between gap-3"><Link to={`/verify?credentialId=${encodeURIComponent(credential.credential_id)}`} className="inline-flex items-center gap-1.5 text-[10px] font-semibold text-[#4c805a] hover:underline">Verify this credential <ExternalLink size={11} /></Link><div className="flex gap-2"><button onClick={copy} className="inline-flex items-center gap-2 rounded-full border border-[#dfe8e1] px-4 py-2.5 text-[11px] font-semibold text-[#4a7257] hover:bg-[#f3faf4]"><Copy size={13} />{copied ? "Copied" : "Copy link"}</button><button onClick={share} className="primary-glow inline-flex items-center gap-2 rounded-full bg-[#1d3d2e] px-4 py-2.5 text-[11px] font-semibold text-white hover:bg-[#28523d]">{shared ? <Check size={13} /> : <ExternalLink size={13} />}{shared ? "Shared" : "Share"}</button></div></div>
       </div>
@@ -2228,22 +2489,22 @@ export default function App() {
   const [settledLocationKey, setSettledLocationKey] = useState<string | null>(null);
   const [journey, setJourney] = useState<AssessmentJourney>(emptyAssessmentJourney);
   const startSingle = useCallback((track: AssessmentTrack) => {
-    setJourney({ tracks: [track], currentIndex: 0, profile: null, active: true });
+    setJourney({ journeyId: null, tracks: [track], currentIndex: 0, profile: null, active: true, scores: {} });
   }, []);
   const startFull = useCallback(() => {
-    setJourney({ tracks: ["problem-solver", "skill", "adapt"], currentIndex: 0, profile: null, active: true });
+    setJourney({ journeyId: crypto.randomUUID(), tracks: ["problem-solver", "skill", "adapt"], currentIndex: 0, profile: null, active: true, scores: {} });
   }, []);
   const rememberProfile = useCallback((profile: AssessmentProfile) => {
     setJourney((current) => ({ ...current, profile }));
   }, []);
-  const advance = useCallback(() => {
+  const advance = useCallback((completedTrack: AssessmentTrack, score: number) => {
     const nextIndex = journey.currentIndex + 1;
     if (nextIndex >= journey.tracks.length) {
-      setJourney(emptyAssessmentJourney);
+      setJourney((current) => ({ ...current, scores: { ...current.scores, [completedTrack]: score } }));
       return null;
     }
     const nextTrack = journey.tracks[nextIndex];
-    setJourney((current) => ({ ...current, currentIndex: nextIndex }));
+    setJourney((current) => ({ ...current, currentIndex: nextIndex, scores: { ...current.scores, [completedTrack]: score } }));
     return nextTrack;
   }, [journey.currentIndex, journey.tracks]);
   const assessmentFlow = useMemo(() => ({
@@ -2274,6 +2535,7 @@ export default function App() {
             <Route path="/" element={<Home />} />
             <Route path="/assessments" element={<AssessmentHub />} />
             <Route path="/assessments/full" element={<FullAssessmentRoute />} />
+            <Route path="/assessments/full/results/:id" element={<FullAssessmentReport />} />
             <Route path="/assessments/result/:id" element={<TrackResultScreen />} />
             <Route path="/assessments/:track" element={<AssessmentTrackRoute />} />
             <Route path="/assessment" element={<Navigate to="/assessments" replace />} />

@@ -6,6 +6,7 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { scoreCandidate, scoreTrackResult } from "../shared/scoring.js";
 import { scoringConfig } from "../shared/scoring-config.js";
+import { adaptScenarioQuestions, skillMcqFallback, validateMcqQuestions } from "../shared/mcq-content.js";
 import {
   chooseTrackVariant,
   findTrackVariant,
@@ -29,7 +30,7 @@ db.exec(`
     keystrokes INTEGER NOT NULL DEFAULT 0,
     code TEXT DEFAULT '', events TEXT DEFAULT '[]', ai_prompts TEXT DEFAULT '[]',
     viva TEXT DEFAULT '[]', flags TEXT DEFAULT '[]', credential_id TEXT,
-    live_check TEXT DEFAULT NULL, session_id TEXT, task_variant TEXT,
+    live_check TEXT DEFAULT NULL, session_id TEXT, journey_id TEXT, task_variant TEXT,
     track TEXT NOT NULL DEFAULT 'skill', domain TEXT NOT NULL DEFAULT 'javascript',
     consented_at TEXT, extra_time INTEGER NOT NULL DEFAULT 0,
     verdict_reason TEXT, flag_details TEXT DEFAULT '[]', ai_text_note TEXT,
@@ -78,6 +79,19 @@ db.exec(`
     reason TEXT NOT NULL DEFAULT '',
     UNIQUE(session_id, question_index)
   );
+  CREATE TABLE IF NOT EXISTS mcq_questions (
+    candidate_id TEXT NOT NULL REFERENCES candidates(id) ON DELETE CASCADE,
+    question_index INTEGER NOT NULL,
+    track TEXT NOT NULL,
+    scenario TEXT NOT NULL DEFAULT '',
+    question TEXT NOT NULL,
+    options TEXT NOT NULL,
+    correct_option TEXT NOT NULL,
+    explanation TEXT NOT NULL,
+    selected_option TEXT,
+    is_correct INTEGER,
+    PRIMARY KEY(candidate_id, question_index)
+  );
   CREATE TABLE IF NOT EXISTS live_checks (
     session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
     tests_passed INTEGER NOT NULL,
@@ -118,6 +132,7 @@ const addCandidateColumn = (name, definition) => {
 addCandidateColumn("keystrokes", "INTEGER NOT NULL DEFAULT 0");
 addCandidateColumn("live_check", "TEXT DEFAULT NULL");
 addCandidateColumn("session_id", "TEXT");
+addCandidateColumn("journey_id", "TEXT");
 addCandidateColumn("task_variant", "TEXT");
 addCandidateColumn("consented_at", "TEXT");
 addCandidateColumn("extra_time", "INTEGER NOT NULL DEFAULT 0");
@@ -594,6 +609,33 @@ app.get("/api/candidates/:id", (req, res) => {
   if (!row) return res.status(404).json({ error: "Candidate not found" });
   res.json(parseCandidate(row));
 });
+app.get("/api/journeys/:journeyId", (req, res) => {
+  const rows = db.prepare(`SELECT c.id AS candidate_id,c.name,tr.track,tr.domain,tr.task_variant,
+      tr.score,tr.signals,tr.evidence,tr.submitted_at
+    FROM candidates c JOIN track_results tr ON tr.candidate_id=c.id
+    WHERE c.journey_id=?
+    ORDER BY CASE tr.track WHEN 'problem-solver' THEN 0 WHEN 'skill' THEN 1 WHEN 'adapt' THEN 2 ELSE 3 END`)
+    .all(req.params.journeyId);
+  if (!rows.length) return res.status(404).json({ error: "Full assessment results not found." });
+  const results = rows.map((row) => ({
+    candidate_id: row.candidate_id,
+    track: row.track,
+    domain: row.domain,
+    task_variant: row.task_variant,
+    score: row.score,
+    signals: JSON.parse(row.signals),
+    evidence: JSON.parse(row.evidence),
+    submitted_at: row.submitted_at,
+  }));
+  const aggregate = scoreCandidate({ trackResults: results });
+  res.json({
+    journey_id: req.params.journeyId,
+    candidate_name: rows[0].name,
+    results,
+    combined_score: aggregate.score,
+    verdict: aggregate.verdict,
+  });
+});
 app.get("/api/verify/:credentialId", (req, res) => {
   const credentialId = String(req.params.credentialId || "").trim();
   if (!credentialId) return res.status(400).json({ error: "A credential ID is required." });
@@ -635,9 +677,12 @@ function validateCandidateInput(candidate) {
 }
 
 app.post("/api/sessions", (req, res) => {
-  const { candidate, track, domain } = req.body ?? {};
+  const { candidate, track, domain, journey_id: journeyId } = req.body ?? {};
   const candidateError = validateCandidateInput(candidate);
   if (candidateError) return res.status(400).json({ error: candidateError });
+  if (journeyId !== undefined && (typeof journeyId !== "string" || !journeyId.trim() || journeyId.length > 100)) {
+    return res.status(400).json({ error: "journey_id must be a non-empty string of at most 100 characters." });
+  }
   const trackDefinition = typeof track === "string" ? getTrack(track) : null;
   if (!trackDefinition || typeof domain !== "string" || !trackDefinition.domains.includes(domain)) {
     return res.status(400).json({ error: "Select a supported assessment track and domain." });
@@ -653,10 +698,10 @@ app.post("/api/sessions", (req, res) => {
   const createSession = db.transaction(() => {
     db.prepare(`INSERT INTO candidates
       (id,name,role,email,score,verdict,status,created_at,duration_seconds,keystrokes,code,events,ai_prompts,
-       viva,flags,credential_id,session_id,task_variant,track,domain,consented_at,extra_time)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
+       viva,flags,credential_id,session_id,journey_id,task_variant,track,domain,consented_at,extra_time)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).run(
       candidateId, candidate.name.trim(), candidate.role?.trim() || "Candidate", (candidate.email || "").trim(), 0,
-      "Needs review", "In progress", now, 0, 0, code, "[]", "[]", "[]", "[]", null, sessionId,
+      "Needs review", "In progress", now, 0, 0, code, "[]", "[]", "[]", "[]", null, sessionId, journeyId || null,
       variant.id, track, domain, now, extraTime,
     );
     db.prepare(`INSERT INTO sessions
@@ -995,6 +1040,44 @@ async function askModel(messages, fallback) {
   return content;
 }
 
+function publicMcqQuestion(row) {
+  return {
+    index: row.question_index,
+    scenario: row.scenario || undefined,
+    question: row.question,
+    options: JSON.parse(row.options),
+    submitted: row.selected_option !== null,
+    ...(row.selected_option !== null ? {
+      selectedOption: row.selected_option,
+      isCorrect: Boolean(row.is_correct),
+      correctOption: row.correct_option,
+      explanation: row.explanation,
+    } : {}),
+  };
+}
+
+function rotateMcqAnswers(questions, candidateId) {
+  const answerIds = ["A", "B", "C", "D"];
+  return questions.map((question, index) => {
+    const shift = stableSeed(`${candidateId}:${index}`) % answerIds.length;
+    const rotated = [...question.options.slice(shift), ...question.options.slice(0, shift)];
+    const correctIndex = rotated.findIndex((option) => option.id === question.correctOption);
+    return {
+      ...question,
+      options: rotated.map((option, optionIndex) => ({ id: answerIds[optionIndex], text: option.text })),
+      correctOption: answerIds[correctIndex],
+    };
+  });
+}
+
+app.get("/api/candidates/:id/questions", (req, res) => {
+  const candidate = db.prepare("SELECT id FROM candidates WHERE id = ?").get(req.params.id);
+  if (!candidate) return res.status(404).json({ error: "Candidate not found" });
+  const questions = db.prepare("SELECT * FROM mcq_questions WHERE candidate_id = ? ORDER BY question_index")
+    .all(candidate.id).map(publicMcqQuestion);
+  res.json({ questions });
+});
+
 app.post("/api/candidates/:id/questions", async (req, res) => {
   const row = db.prepare("SELECT * FROM candidates WHERE id = ?").get(req.params.id);
   if (!row) return res.status(404).json({ error: "Candidate not found" });
@@ -1002,6 +1085,71 @@ app.post("/api/candidates/:id/questions", async (req, res) => {
   const taskVariant = session
     ? findTrackVariant(session.track, session.domain, session.task_variant)
     : null;
+
+  if (req.body?.mcq === true) {
+    const track = session?.track || row.track;
+    if (!session || !["skill", "adapt"].includes(track)) {
+      return res.status(400).json({ error: "MCQ viva is available for Skill and Adapt sessions." });
+    }
+    const storedQuestions = db.prepare("SELECT * FROM mcq_questions WHERE candidate_id = ? ORDER BY question_index").all(row.id);
+    if (storedQuestions.length && storedQuestions.every((item) => item.track === track)) {
+      return res.json({ questions: storedQuestions.map(publicMcqQuestion) });
+    }
+    let questions;
+    if (track === "adapt") {
+      questions = adaptScenarioQuestions;
+    } else {
+      const questionsFallback = skillMcqFallback(taskVariant, session.domain);
+      try {
+        const raw = await askModel([
+          { role: "system", content: "Create exactly 5 task-specific multiple-choice viva questions. Return only JSON with this shape: [{\"question\":\"...\",\"options\":[{\"id\":\"A\",\"text\":\"...\"},{\"id\":\"B\",\"text\":\"...\"},{\"id\":\"C\",\"text\":\"...\"},{\"id\":\"D\",\"text\":\"...\"}],\"correctOption\":\"A\",\"explanation\":\"...\"}]. Each question must have four distinct plausible options and exactly one correct option. Explanations must justify the correct choice. Ask about the actual task, submitted work, domain, and useful edge cases; do not ask generic trivia." },
+          { role: "user", content: `Task: ${req.body.task || taskVariant?.description || "Complete the configured practical task."}\nDomain: ${session.domain}\nTask variant: ${taskVariant?.title || session.task_variant}\nCandidate submission:\n${row.code}` },
+        ], JSON.stringify(questionsFallback));
+        try { questions = JSON.parse(raw); } catch {
+          if (process.env.LLM_API_KEY) return res.status(502).json({ error: "The AI returned invalid MCQ viva questions. Please try again." });
+          questions = questionsFallback;
+        }
+        if (!validateMcqQuestions(questions, 5)) {
+          if (process.env.LLM_API_KEY) return res.status(502).json({ error: "The AI returned an invalid MCQ viva format. Please try again." });
+          questions = questionsFallback;
+        }
+      } catch (error) {
+        return res.status(502).json({ error: error.message || "Could not create viva questions." });
+      }
+    }
+    if (!validateMcqQuestions(questions, track === "adapt" ? 8 : 5)) {
+      return res.status(500).json({ error: "The configured MCQ questions are invalid." });
+    }
+    const latestQuestions = db.prepare("SELECT * FROM mcq_questions WHERE candidate_id = ? ORDER BY question_index").all(row.id);
+    if (latestQuestions.length && latestQuestions.every((item) => item.track === track)) {
+      return res.json({ questions: latestQuestions.map(publicMcqQuestion) });
+    }
+    questions = rotateMcqAnswers(questions, row.id);
+    const viva = questions.map((item) => ({ question: item.question, answer: "", score: null, feedback: "" }));
+    const insertQuestion = db.prepare(`INSERT INTO mcq_questions
+      (candidate_id,question_index,track,scenario,question,options,correct_option,explanation)
+      VALUES (?,?,?,?,?,?,?,?)`);
+    const saveQuestions = db.transaction(() => {
+      db.prepare("DELETE FROM mcq_questions WHERE candidate_id = ?").run(row.id);
+      db.prepare("UPDATE candidates SET viva = ?,status = 'Viva in progress' WHERE id = ?")
+        .run(JSON.stringify(viva), row.id);
+      if (session) db.prepare("DELETE FROM viva_qas WHERE session_id = ?").run(session.id);
+      questions.forEach((item, index) => {
+        insertQuestion.run(row.id, index, track, item.scenario || "", item.question,
+          JSON.stringify(item.options), item.correctOption, item.explanation);
+        if (session) insertVivaQa.run(randomUUID(), session.id, index, item.question, "", null, "");
+      });
+    });
+    saveQuestions();
+    return res.json({ questions: questions.map((item, index) => ({
+      index,
+      scenario: item.scenario || undefined,
+      question: item.question,
+      options: item.options,
+      submitted: false,
+    })) });
+  }
+
   const questionsFallback = baseQuestions(taskVariant, Boolean(session?.requirement_change_seen));
   try {
     const raw = await askModel([
@@ -1038,6 +1186,56 @@ app.post("/api/candidates/:id/answer", async (req, res) => {
     return res.status(400).json({ error: "A valid question and answer are required." });
   }
   try {
+    const mcq = db.prepare("SELECT * FROM mcq_questions WHERE candidate_id = ? AND question_index = ?")
+      .get(row.id, index);
+    if (mcq) {
+      const choices = JSON.parse(mcq.options);
+      if (!choices.some((choice) => choice.id === answer)) {
+        return res.status(400).json({ error: "Select one of the four answer options." });
+      }
+      if (mcq.selected_option !== null) {
+        if (mcq.selected_option !== answer) return res.status(409).json({ error: "This question has already been submitted." });
+        return res.json({
+          answer: viva[index],
+          score_10: mcq.is_correct ? 10 : 0,
+          reason: mcq.explanation,
+          isCorrect: Boolean(mcq.is_correct),
+          correctOption: mcq.correct_option,
+          explanation: mcq.explanation,
+        });
+      }
+      const nextQuestion = db.prepare(`SELECT MIN(question_index) AS question_index FROM mcq_questions
+        WHERE candidate_id = ? AND selected_option IS NULL`).get(row.id)?.question_index;
+      if (nextQuestion !== index) return res.status(409).json({ error: "Answer the viva questions in order." });
+      const isCorrect = answer === mcq.correct_option;
+      viva[index] = {
+        ...viva[index],
+        answer,
+        score: isCorrect ? 100 : 0,
+        feedback: mcq.explanation,
+      };
+      const session = db.prepare("SELECT * FROM sessions WHERE candidate_id = ?").get(row.id);
+      const saveAnswer = db.transaction(() => {
+        db.prepare("UPDATE mcq_questions SET selected_option = ?,is_correct = ? WHERE candidate_id = ? AND question_index = ?")
+          .run(answer, isCorrect ? 1 : 0, row.id, index);
+        db.prepare("UPDATE candidates SET viva = ? WHERE id = ?").run(JSON.stringify(viva), row.id);
+        if (session) db.prepare(`INSERT INTO viva_qas (id,session_id,question_index,question,answer,score,reason)
+          VALUES (?,?,?,?,?,?,?) ON CONFLICT(session_id,question_index) DO UPDATE SET
+          answer=excluded.answer,score=excluded.score,reason=excluded.reason`).run(
+          randomUUID(), session.id, index, viva[index].question, answer, isCorrect ? 10 : 0, mcq.explanation,
+        );
+      });
+      saveAnswer();
+      return res.json({
+        answer: viva[index],
+        score_10: isCorrect ? 10 : 0,
+        reason: mcq.explanation,
+        isCorrect,
+        correctOption: mcq.correct_option,
+        explanation: mcq.explanation,
+      });
+    }
+
     const rubric = `Score the answer from 0 to 10 for demonstrated understanding, not writing style. Return JSON only: {"score": number, "feedback": "one sentence"}.`;
     const fallbackScore = demoAnswerScore(viva[index].question, answer.trim());
     let result;
@@ -1142,7 +1340,7 @@ app.post("/api/candidates/:id/complete", (req, res) => {
     vivaText: viva.map((item) => item.answer || "").join(" "),
     trackResults,
   });
-  const credential = result.verdict === "Verified skill" ? `sp-${randomUUID().slice(0, 12)}` : null;
+  const credential = result.verdict === "Verified skill" ? `FF-${randomUUID().slice(0, 12)}` : null;
   const flagDetails = result.flags;
   const flags = flagDetails.map((flag) => `${flag.key}: ${flag.evidence}`);
   const status = result.verdict === "Verified skill" ? "Verified" : result.verdict === "Needs review" ? "Review" : "Low confidence";
@@ -1276,5 +1474,5 @@ app.use((error, _req, res, next) => {
 });
 
 const port = Number(process.env.PORT || 3001);
-const server = app.listen(port, () => console.log(`SkillProof API listening on http://localhost:${port}`));
+const server = app.listen(port, () => console.log(`FutureFit API listening on http://localhost:${port}`));
 server.on("error", (error) => console.error("API listener error:", error));
